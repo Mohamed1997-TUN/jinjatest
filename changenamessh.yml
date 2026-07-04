@@ -1,0 +1,33 @@
+---
+- name: Test FortiGate hostname change
+  hosts: fortigate
+  gather_facts: false
+
+  vars_files:
+    - vars/changename.vars
+
+  tasks:
+
+    - name: Render template
+      ansible.builtin.template:
+        src: template/hostname_template.j2
+        dest: /tmp/hostname.cfg
+      delegate_to: localhost
+
+    - name: Show generated configuration
+      ansible.builtin.command:
+        cmd: cat /tmp/hostname.cfg
+      register: generated_config
+      delegate_to: localhost
+
+    - name: Print generated configuration
+      ansible.builtin.debug:
+        var: generated_config.stdout
+
+    - name: Send configuration to FortiGate
+      ansible.builtin.raw: "{{ generated_config.stdout }}"
+      register: result
+
+    - name: Show result
+      ansible.builtin.debug:
+        var: result

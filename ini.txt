@@ -1,5 +1,5 @@
 [fortigate]
-192.168.11.140
+192.168.80.133
 
 [fortigate:vars]
 ansible_connection=ssh
