@@ -1,10 +1,15 @@
-- name: Change FortiGate Hostname
+---
+- name: Change FortiGate hostname
   hosts: fortigate
   gather_facts: false
 
   tasks:
-    - name: Configure FortiGate hostname
-      fortios_system_global:
-        vdom: "root"
-        system_global:
-          hostname: "FortiGate-dhia"
+    - name: Change hostname
+      ansible.builtin.raw: |
+        config system global
+            set hostname FortiGate-dhia
+        end
+      register: result
+
+    - debug:
+        var: result
