@@ -1,6 +1,6 @@
 ---
 - name: Test FortiGate hostname change
-  hosts: fortigate
+  hosts: all
   gather_facts: false
 
   vars_files:
