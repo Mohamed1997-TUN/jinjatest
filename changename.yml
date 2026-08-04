@@ -1,6 +1,6 @@
 ---
 - name: Configure FortiGate via SSH (with raw module)
-  hosts: fortigate
+  hosts: Netbox
   gather_facts: false
 
   vars_files:
