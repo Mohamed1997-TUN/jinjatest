@@ -1,0 +1,13 @@
+---
+- name: Test SSH Connection to FortiGate
+  hosts: fortigate
+  gather_facts: false
+
+  tasks:
+    - name: Run "get system status"
+      ansible.builtin.raw: get system status
+      register: result
+
+    - name: Display output
+      ansible.builtin.debug:
+        var: result
