@@ -1,6 +1,6 @@
 ---
 - name: Configure FortiGate via SSH (with raw module)
-  hosts: core-firewall
+  hosts: all
   gather_facts: false
 
   vars_files:
