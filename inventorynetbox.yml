@@ -1,6 +1,6 @@
 plugin: netbox.netbox.nb_inventory
 api_endpoint: http://192.168.101.132:8000
-token: llvN64YrbxOt2X97EJT15vc82nkNzpqdDQg1BZvK
+token: FTU9ajghTYEVw8bhsI0CS5rqyCvraG5a0FMs0fNM
 validate_certs: false
 config_context: true
 interfaces: true
