@@ -29,7 +29,7 @@
 
     - name: Get NetBox device information
       ansible.builtin.uri:
-        url: "{{ netbox_api_url }}/api/dcim/devices/{{ netbox_device_id }}/"
+        url: "http://192.168.101.132:8000/api/dcim/devices/{{ netbox_device_id }}/"
         method: GET
         headers:
           Authorization: "Token {{ netbox_api_token }}"
