@@ -20,8 +20,10 @@
         fail_msg: >
           netbox_device_id was not provided.
           This playbook must be launched with a NetBox device ID.
-        success_msg: "NetBox device ID received: {{ netbox_device_id }}"
+        success_msg: >
+          NetBox device ID received: {{ netbox_device_id }}
       delegate_to: localhost
+      run_once: true
 
 
     # =========================================================
@@ -40,6 +42,7 @@
         status_code: 200
       delegate_to: localhost
       register: netbox_device
+      run_once: true
       no_log: true
 
 
@@ -57,36 +60,34 @@
           - netbox_device.json.primary_ip4.address is defined
         fail_msg: >
           NetBox device {{ netbox_device_id }} does not contain
-          the required serial or primary management IP.
+          the required serial number or primary IP address.
       delegate_to: localhost
+      run_once: true
 
 
     # =========================================================
-    # 4. Extract the serial number
+    # 4. Extract serial number from NetBox
     # =========================================================
 
     - name: Set firewall serial
       ansible.builtin.set_fact:
         firewall_serial: "{{ netbox_device.json.serial }}"
-      delegate_to: localhost
 
 
     # =========================================================
-    # 5. Extract current management IP from NetBox
+    # 5. Extract CURRENT management IP from NetBox
     #
-    # This IP is ONLY used to identify/reach the discovered
-    # FortiGate initially.
+    # This is the IP currently used to reach the FortiGate.
     # =========================================================
 
     - name: Set current management IP
       ansible.builtin.set_fact:
         current_management_ip: >-
           {{ netbox_device.json.primary_ip4.address.split('/')[0] }}
-      delegate_to: localhost
 
 
     # =========================================================
-    # 6. Find desired configuration using SERIAL
+    # 6. Find desired firewall configuration using SERIAL
     # =========================================================
 
     - name: Find firewall configuration
@@ -98,7 +99,6 @@
             | list
             | first
           }}
-      delegate_to: localhost
 
 
     # =========================================================
@@ -117,53 +117,48 @@
         fail_msg: >
           Firewall with serial {{ firewall_serial }}
           was not found or is incomplete in vars/firewalls.vars.
-      delegate_to: localhost
 
 
     # =========================================================
-    # 8. Display provisioning information
+    # 8. Determine which inventory host is the target
+    #
+    # Example:
+    #
+    # NetBox current IP = 192.168.101.135
+    #
+    # 192.168.101.135 -> TARGET
+    # 192.168.101.138 -> SKIP
     # =========================================================
 
-    - name: Display provisioning target
+    - name: Identify target FortiGate
+      ansible.builtin.set_fact:
+        is_target_firewall: >-
+          {{
+            (ansible_host | default(inventory_hostname))
+            == current_management_ip
+          }}
+
+
+    # =========================================================
+    # 9. Display provisioning information
+    # =========================================================
+
+    - name: Display provisioning information
       ansible.builtin.debug:
         msg:
-          - "NetBox Device ID       : {{ netbox_device.json.id }}"
-          - "Serial                  : {{ firewall_serial }}"
-          - "Current management IP   : {{ current_management_ip }}"
-          - "Desired hostname        : {{ target_firewall.hostname }}"
-          - "Desired management IP  : {{ target_firewall.management_ip }}"
-          - "Desired subnet mask    : {{ target_firewall.management_mask }}"
-      delegate_to: localhost
+          - "Inventory Host        : {{ inventory_hostname }}"
+          - "Ansible Host          : {{ ansible_host | default(inventory_hostname) }}"
+          - "NetBox Device ID      : {{ netbox_device.json.id }}"
+          - "Serial                : {{ firewall_serial }}"
+          - "Current IP            : {{ current_management_ip }}"
+          - "Desired Hostname      : {{ target_firewall.hostname }}"
+          - "Desired Management IP : {{ target_firewall.management_ip }}"
+          - "Desired Subnet Mask   : {{ target_firewall.management_mask }}"
+          - "Target Firewall       : {{ is_target_firewall }}"
 
 
     # =========================================================
-    # 9. Select ONLY the inventory host corresponding to the
-    #    discovered FortiGate.
-    #
-    #    This prevents hosts such as 192.168.101.138 from
-    #    receiving the configuration.
-    # =========================================================
-
-    - name: Identify provisioning target
-      ansible.builtin.debug:
-        msg: "Targeting {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
-
-
-    # =========================================================
-    # 10. Set hostname variable for Jinja2
-    # =========================================================
-
-    - name: Set desired hostname
-      ansible.builtin.set_fact:
-        new_hostname: "{{ target_firewall.hostname }}"
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
-
-
-    # =========================================================
-    # 11. Render provisioning configuration
+    # 10. Render provisioning configuration
     # =========================================================
 
     - name: Render FortiGate provisioning configuration
@@ -172,12 +167,11 @@
         dest: /tmp/firewall_provisioning.cfg
         mode: "0600"
       delegate_to: localhost
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 12. Read generated configuration
+    # 11. Read generated configuration
     # =========================================================
 
     - name: Read generated configuration
@@ -185,12 +179,11 @@
         src: /tmp/firewall_provisioning.cfg
       register: generated_config_file
       delegate_to: localhost
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 13. Display generated configuration
+    # 12. Display generated configuration
     #
     # Keep this during testing.
     # =========================================================
@@ -198,45 +191,45 @@
     - name: Display generated configuration
       ansible.builtin.debug:
         msg: "{{ generated_config_file.content | b64decode }}"
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      delegate_to: localhost
+      when: is_target_firewall
 
 
     # =========================================================
-    # 14. Apply configuration
+    # 13. Apply hostname + management IP
     # =========================================================
 
     - name: Apply FortiGate provisioning configuration
       ansible.builtin.raw: "{{ generated_config_file.content | b64decode }}"
       register: fortigate_result
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 15. Display FortiGate result
+    # 14. Display configuration result
     # =========================================================
 
     - name: Display FortiGate configuration result
       ansible.builtin.debug:
         var: fortigate_result.stdout
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 16. Wait for FortiGate to apply the new configuration
+    # 15. Wait for FortiGate to apply the configuration
     # =========================================================
 
     - name: Wait for FortiGate configuration
       ansible.builtin.pause:
         seconds: 15
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 17. Wait for the desired management IP
+    # 16. Wait for NEW management IP
+    #
+    # This verifies that the desired IP is actually reachable
+    # before we continue.
     # =========================================================
 
     - name: Wait for new management IP SSH
@@ -247,23 +240,21 @@
         delay: 2
         timeout: 60
       delegate_to: localhost
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 18. Change Ansible connection to the desired IP
+    # 17. Update Ansible connection address
     # =========================================================
 
-    - name: Update Ansible connection address
+    - name: Update Ansible connection to new management IP
       ansible.builtin.set_fact:
         ansible_host: "{{ target_firewall.management_ip }}"
-      when:
-        - (ansible_host | default(inventory_hostname)) == current_management_ip
+      when: is_target_firewall
 
 
     # =========================================================
-    # 19. Reset SSH connection
+    # 18. Reset existing SSH connection
     # =========================================================
 
     - name: Reset SSH connection
@@ -271,22 +262,42 @@
 
 
     # =========================================================
-    # 20. Verify connection to new management IP
+    # 19. Verify FortiGate through NEW IP
     # =========================================================
 
-    - name: Verify FortiGate connection
+    - name: Verify FortiGate connectivity on new IP
       ansible.builtin.raw: "get system status"
       register: verification_result
-      when:
-        - (ansible_host | default(inventory_hostname)) == target_firewall.management_ip
+      changed_when: false
+      when: is_target_firewall
 
 
     # =========================================================
-    # 21. Display verification
+    # 20. Display verification
     # =========================================================
 
     - name: Display FortiGate verification
       ansible.builtin.debug:
         var: verification_result.stdout
-      when:
-        - (ansible_host | default(inventory_hostname)) == target_firewall.management_ip
+      when: is_target_firewall
+
+
+    # =========================================================
+    # 21. Validate final connection
+    #
+    # If this fails, the AWX job becomes FAILED and the next
+    # workflow node should NOT execute.
+    # =========================================================
+
+    - name: Validate FortiGate connectivity
+      ansible.builtin.assert:
+        that:
+          - verification_result.rc == 0
+          - verification_result.stdout is search('Version:')
+        fail_msg: >
+          FortiGate verification failed after changing the
+          management IP to {{ target_firewall.management_ip }}.
+        success_msg: >
+          FortiGate successfully provisioned and verified on
+          {{ target_firewall.management_ip }}.
+      when: is_target_firewall
