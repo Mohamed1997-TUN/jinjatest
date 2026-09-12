@@ -8,36 +8,165 @@
 
   tasks:
 
-    - name: Get firewall information
-      # obtain information dynamically from NetBox
-      ...
+    # ---------------------------------------------------------
+    # 1. Validate required AWX input
+    # ---------------------------------------------------------
 
-    - name: Find firewall in firewalls.vars
-      ...
-      
-    - name: Validate firewall
-      ...
+    - name: Validate NetBox device ID
+      ansible.builtin.assert:
+        that:
+          - netbox_device_id is defined
+          - netbox_device_id | string | length > 0
+        fail_msg: >
+          netbox_device_id was not provided.
+          This playbook must be launched with a NetBox device ID.
+        success_msg: "NetBox device ID received: {{ netbox_device_id }}"
 
-    - name: Render template
+
+    # ---------------------------------------------------------
+    # 2. Retrieve the firewall information from NetBox
+    # ---------------------------------------------------------
+
+    - name: Get NetBox device information
+      ansible.builtin.uri:
+        url: "{{ netbox_api_url }}/api/dcim/devices/{{ netbox_device_id }}/"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_api_token }}"
+          Accept: "application/json"
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      delegate_to: localhost
+      register: netbox_device
+      no_log: true
+
+
+    # ---------------------------------------------------------
+    # 3. Validate NetBox response
+    # ---------------------------------------------------------
+
+    - name: Validate NetBox device data
+      ansible.builtin.assert:
+        that:
+          - netbox_device.json.id is defined
+          - netbox_device.json.name is defined
+          - netbox_device.json.serial is defined
+          - netbox_device.json.serial | length > 0
+        fail_msg: >
+          NetBox device {{ netbox_device_id }} does not contain
+          the required device information.
+      delegate_to: localhost
+
+
+    # ---------------------------------------------------------
+    # 4. Extract stable firewall identity
+    # ---------------------------------------------------------
+
+    - name: Set firewall serial from NetBox
+      ansible.builtin.set_fact:
+        firewall_serial: "{{ netbox_device.json.serial }}"
+      delegate_to: localhost
+
+
+    # ---------------------------------------------------------
+    # 5. Find firewall in firewalls.vars
+    # ---------------------------------------------------------
+
+    - name: Find firewall configuration
+      ansible.builtin.set_fact:
+        target_firewall: >-
+          {{
+            firewalls
+            | selectattr('serial', 'equalto', firewall_serial)
+            | list
+            | first
+          }}
+      delegate_to: localhost
+
+
+    # ---------------------------------------------------------
+    # 6. Make sure firewall exists in the entry file
+    # ---------------------------------------------------------
+
+    - name: Validate firewall configuration
+      ansible.builtin.assert:
+        that:
+          - target_firewall is defined
+          - target_firewall is not none
+          - target_firewall.hostname is defined
+          - target_firewall.management_ip is defined
+        fail_msg: >
+          Firewall with serial {{ firewall_serial }}
+          was not found or is incomplete in vars/firewalls.vars.
+      delegate_to: localhost
+
+
+    # ---------------------------------------------------------
+    # 7. Display selected firewall
+    # ---------------------------------------------------------
+
+    - name: Display provisioning target
+      ansible.builtin.debug:
+        msg:
+          - "NetBox Device ID : {{ netbox_device.json.id }}"
+          - "NetBox Name      : {{ netbox_device.json.name }}"
+          - "Serial           : {{ target_firewall.serial }}"
+          - "Hostname         : {{ target_firewall.hostname }}"
+          - "Management IP    : {{ target_firewall.management_ip }}"
+      delegate_to: localhost
+
+
+    # ---------------------------------------------------------
+    # 8. Set hostname for Jinja2 template
+    # ---------------------------------------------------------
+
+    - name: Set hostname
+      ansible.builtin.set_fact:
+        new_hostname: "{{ target_firewall.hostname }}"
+
+
+    # ---------------------------------------------------------
+    # 9. Render FortiGate configuration
+    # ---------------------------------------------------------
+
+    - name: Render FortiGate hostname configuration
       ansible.builtin.template:
         src: template/hostname_template.j2
         dest: /tmp/hostname.cfg
+        mode: "0600"
       delegate_to: localhost
 
-    - name: Show generated configuration
-      ansible.builtin.command:
-        cmd: cat /tmp/hostname.cfg
-      register: generated_config
+
+    # ---------------------------------------------------------
+    # 10. Display generated configuration
+    # ---------------------------------------------------------
+
+    - name: Read generated configuration
+      ansible.builtin.slurp:
+        src: /tmp/hostname.cfg
+      register: generated_config_file
       delegate_to: localhost
 
-    - name: Print generated configuration
-      ansible.builtin.debug:
-        var: generated_config.stdout
 
-    - name: Send configuration to FortiGate
-      ansible.builtin.raw: "{{ generated_config.stdout }}"
-      register: result
-
-    - name: Show result
+    - name: Display generated configuration
       ansible.builtin.debug:
-        var: result
+        msg: "{{ generated_config_file.content | b64decode }}"
+
+
+    # ---------------------------------------------------------
+    # 11. Send configuration to FortiGate
+    # ---------------------------------------------------------
+
+    - name: Apply hostname configuration
+      ansible.builtin.raw: "{{ generated_config_file.content | b64decode }}"
+      register: fortigate_result
+
+
+    # ---------------------------------------------------------
+    # 12. Display FortiGate result
+    # ---------------------------------------------------------
+
+    - name: Display FortiGate result
+      ansible.builtin.debug:
+        var: fortigate_result.stdout
