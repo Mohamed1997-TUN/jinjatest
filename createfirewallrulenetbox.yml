@@ -19,12 +19,17 @@
           - netbox_device_id | string | length > 0
         fail_msg: >
           netbox_device_id was not provided by the AWX workflow.
-        success_msg: "NetBox device ID received: {{ netbox_device_id }}"
+        success_msg: >
+          NetBox device ID received: {{ netbox_device_id }}
       delegate_to: localhost
+      run_once: true
 
 
     # =========================================================
-    # 2. Retrieve the NetBox device
+    # 2. Get device information from NetBox
+    #
+    # At this point the first job has already updated the
+    # management IP.
     # =========================================================
 
     - name: Get NetBox device information
@@ -39,11 +44,12 @@
         status_code: 200
       delegate_to: localhost
       register: netbox_device
+      run_once: true
       no_log: true
 
 
     # =========================================================
-    # 3. Validate NetBox response
+    # 3. Validate NetBox information
     # =========================================================
 
     - name: Validate NetBox device
@@ -55,40 +61,70 @@
           - netbox_device.json.primary_ip4.address is defined
         fail_msg: >
           NetBox device {{ netbox_device_id }} does not contain
-          the required serial or primary IP.
+          a serial number or primary IP address.
       delegate_to: localhost
+      run_once: true
 
 
     # =========================================================
-    # 4. Extract current IP
+    # 4. Extract the CURRENT management IP
+    #
+    # This should now be the NEW IP configured by the first job.
     # =========================================================
 
-    - name: Set current FortiGate IP
+    - name: Set current FortiGate management IP
       ansible.builtin.set_fact:
         target_management_ip: >-
           {{ netbox_device.json.primary_ip4.address.split('/')[0] }}
-      delegate_to: localhost
 
 
     # =========================================================
-    # 5. Display targeting information
+    # 5. Identify the correct inventory host
     # =========================================================
 
-    - name: Display firewall-rule target
+    - name: Determine target FortiGate
+      ansible.builtin.set_fact:
+        is_target_firewall: >-
+          {{
+            (ansible_host | default(inventory_hostname))
+            == target_management_ip
+          }}
+
+
+    # =========================================================
+    # 6. Display targeting information
+    # =========================================================
+
+    - name: Display firewall rule target
       ansible.builtin.debug:
         msg:
-          - "NetBox Device ID : {{ netbox_device.json.id }}"
+          - "NetBox Device ID : {{ netbox_device_id }}"
           - "Serial           : {{ netbox_device.json.serial }}"
           - "Target IP        : {{ target_management_ip }}"
           - "Inventory Host   : {{ inventory_hostname }}"
           - "Ansible Host     : {{ ansible_host | default(inventory_hostname) }}"
-      delegate_to: localhost
+          - "Target           : {{ is_target_firewall }}"
 
 
     # =========================================================
-    # 6. Render firewall-rule configuration
+    # 7. Wait for the new management IP
     #
-    # This happens only on localhost.
+    # Extra safety check before pushing firewall rules.
+    # =========================================================
+
+    - name: Verify target FortiGate SSH
+      ansible.builtin.wait_for:
+        host: "{{ target_management_ip }}"
+        port: 22
+        state: started
+        delay: 2
+        timeout: 60
+      delegate_to: localhost
+      when: is_target_firewall
+
+
+    # =========================================================
+    # 8. Render firewall rule configuration
     # =========================================================
 
     - name: Render firewall rule configuration
@@ -97,10 +133,11 @@
         dest: /tmp/fortigate_config.txt
         mode: "0600"
       delegate_to: localhost
+      when: is_target_firewall
 
 
     # =========================================================
-    # 7. Read generated configuration
+    # 9. Read generated configuration
     # =========================================================
 
     - name: Read generated configuration
@@ -108,52 +145,66 @@
         src: /tmp/fortigate_config.txt
       register: slurped_config
       delegate_to: localhost
+      when: is_target_firewall
 
 
     # =========================================================
-    # 8. Display generated configuration
+    # 10. Display generated configuration
     # =========================================================
 
     - name: Display generated firewall rule configuration
       ansible.builtin.debug:
         msg: "{{ slurped_config.content | b64decode }}"
       delegate_to: localhost
+      when: is_target_firewall
 
 
     # =========================================================
-    # 9. Push configuration ONLY to the FortiGate associated
-    #    with the NetBox device ID
+    # 11. Check whether configuration is allowed
     # =========================================================
 
-    - name: Push CLI config to target FortiGate
+    - name: Check firewall rule policy
+      ansible.builtin.assert:
+        that:
+          - "'❌ Not allowed' not in (slurped_config.content | b64decode)"
+          - slurped_config.content | b64decode | length > 0
+        fail_msg: >
+          Firewall rule configuration was blocked by the policy
+          validation in firewallrule.j2.
+      when: is_target_firewall
+
+
+    # =========================================================
+    # 12. Push firewall rule ONLY to target FortiGate
+    # =========================================================
+
+    - name: Push firewall rule configuration
       ansible.builtin.raw: "{{ slurped_config.content | b64decode }}"
       register: result
-      when:
-        - (ansible_host | default(inventory_hostname)) == target_management_ip
-        - "'❌ Not allowed' not in (slurped_config.content | b64decode)"
-        - slurped_config.content | b64decode | length > 0
+      when: is_target_firewall
 
 
     # =========================================================
-    # 10. Display policy violation
+    # 13. Display FortiGate result
     # =========================================================
 
-    - name: Display policy violation
+    - name: Display firewall rule result
       ansible.builtin.debug:
-        msg: "{{ (slurped_config.content | b64decode) | regex_search('❌ Not allowed:.*') }}"
+        var: result.stdout
       when:
-        - "'❌ Not allowed' in (slurped_config.content | b64decode)"
-        - (ansible_host | default(inventory_hostname)) == target_management_ip
+        - is_target_firewall
+        - result is defined
 
 
     # =========================================================
-    # 11. Display successful application
+    # 14. Final success
     # =========================================================
 
     - name: Display success
       ansible.builtin.debug:
-        msg: "✅ Firewall rule configuration applied successfully!"
+        msg: >
+          ✅ Firewall rule configuration successfully applied to
+          FortiGate {{ target_management_ip }}.
       when:
+        - is_target_firewall
         - result is defined
-        - result.stdout is defined
-        - (ansible_host | default(inventory_hostname)) == target_management_ip
