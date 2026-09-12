@@ -39,7 +39,7 @@
         status_code: 200
       delegate_to: localhost
       register: netbox_device
-      no_log: true
+      no_log: false
 
 
     # ---------------------------------------------------------
