@@ -32,7 +32,7 @@
         url: "http://192.168.101.132:8000/api/dcim/devices/{{ netbox_device_id }}/"
         method: GET
         headers:
-          Authorization: "Token {{ netbox_api_token }}"
+          Authorization: "Bearer 8kYiE8QhcC5Gt0an3cKLeU0tqsFZzx"
           Accept: "application/json"
         validate_certs: false
         return_content: true
