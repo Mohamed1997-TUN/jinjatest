@@ -168,7 +168,7 @@
 
     - name: Render FortiGate provisioning configuration
       ansible.builtin.template:
-        src: firewall_provisioning.j2
+        src: "{{ playbook_dir }}/template/firewall_provisioning.j2"
         dest: /tmp/firewall_provisioning.cfg
         mode: "0600"
       delegate_to: localhost
