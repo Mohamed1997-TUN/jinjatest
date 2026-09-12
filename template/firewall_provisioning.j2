@@ -1,12 +1,9 @@
-{% set mgmt_ip = target_firewall.management_ip | ansible.utils.ipaddr('address') %}
-{% set mgmt_mask = target_firewall.management_ip | ansible.utils.ipaddr('netmask') %}
-
 config system global
     set hostname {{ target_firewall.hostname }}
 end
 
 config system interface
     edit "port1"
-        set ip {{ mgmt_ip }} {{ mgmt_mask }}
+        set ip {{ target_firewall.management_ip }} {{ target_firewall.management_mask }}
     next
 end
