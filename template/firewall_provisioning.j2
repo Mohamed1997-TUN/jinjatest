@@ -1,0 +1,9 @@
+config system global
+    set hostname {{ target_firewall.hostname }}
+end
+
+config system interface
+    edit "port1"
+        set ip {{ target_firewall.management_ip }}
+    next
+end
