@@ -144,7 +144,7 @@
 
     - name: Read generated configuration
       ansible.builtin.slurp:
-        src: /tmp/hostname.cfg
+        src: /tmp/firewall_provisioning.cfg
       register: generated_config_file
       delegate_to: localhost
 
