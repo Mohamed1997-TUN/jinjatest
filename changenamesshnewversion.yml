@@ -132,8 +132,8 @@
 
     - name: Render FortiGate hostname configuration
       ansible.builtin.template:
-        src: template/hostname_template.j2
-        dest: /tmp/hostname.cfg
+        src: template/template/firewall_provisioning.j2
+        dest: /tmp/firewall_provisioning.cfg
         mode: "0600"
       delegate_to: localhost
 
