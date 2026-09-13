@@ -40,7 +40,7 @@
         url: "http://192.168.101.132:8000/api/dcim/devices/{{ netbox_device_id }}/"
         method: GET
         headers:
-          Authorization: "Bearer iS1ny9JSpLUazDMkp0g3dcYHK2zPutpbEkigl0oY"
+          Authorization: "Token iS1ny9JSpLUazDMkp0g3dcYHK2zPutpbEkigl0oY"
           Accept: "application/json"
         validate_certs: false
         return_content: true
@@ -48,7 +48,7 @@
       delegate_to: localhost
       register: netbox_device
       run_once: true
-      no_log: true
+      no_log: false
       until:
         - netbox_device.json.id is defined
         - netbox_device.json.serial is defined
