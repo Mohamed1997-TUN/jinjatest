@@ -4,6 +4,7 @@ end
 
 config system interface
     edit "port1"
+        set mode static
         set ip {{ target_firewall.management_ip }} {{ target_firewall.management_mask }}
     next
 end
