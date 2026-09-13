@@ -154,7 +154,33 @@
 
 
     # =========================================================
-    # 9. Display provisioning information
+    # 9. Determine if management IP change is required
+    #
+    # SAME IP:
+    #
+    # Current = 192.168.101.135
+    # Target  = 192.168.101.135
+    #
+    # -> No IP change required
+    #
+    # DIFFERENT IP:
+    #
+    # Current = 192.168.101.142
+    # Target  = 192.168.101.136
+    #
+    # -> IP change required
+    # =========================================================
+
+    - name: Determine if management IP change is required
+      ansible.builtin.set_fact:
+        ip_change_required: >-
+          {{
+            current_management_ip != target_firewall.management_ip
+          }}
+
+
+    # =========================================================
+    # 10. Display provisioning information
     # =========================================================
 
     - name: Display provisioning information
@@ -169,10 +195,11 @@
           - "Desired Management IP : {{ target_firewall.management_ip }}"
           - "Desired Subnet Mask   : {{ target_firewall.management_mask }}"
           - "Target Firewall       : {{ is_target_firewall }}"
+          - "IP Change Required    : {{ ip_change_required }}"
 
 
     # =========================================================
-    # 10. Render provisioning configuration
+    # 11. Render provisioning configuration
     # =========================================================
 
     - name: Render FortiGate provisioning configuration
@@ -185,7 +212,7 @@
 
 
     # =========================================================
-    # 11. Read generated configuration
+    # 12. Read generated configuration
     # =========================================================
 
     - name: Read generated configuration
@@ -197,7 +224,7 @@
 
 
     # =========================================================
-    # 12. Display generated configuration
+    # 13. Display generated configuration
     #
     # Keep this during testing.
     # =========================================================
@@ -210,7 +237,7 @@
 
 
     # =========================================================
-    # 13. Apply hostname + management IP
+    # 14. Apply hostname + management IP
     # =========================================================
 
     - name: Apply FortiGate provisioning configuration
@@ -220,7 +247,7 @@
 
 
     # =========================================================
-    # 14. Display configuration result
+    # 15. Display configuration result
     # =========================================================
 
     - name: Display FortiGate configuration result
@@ -230,7 +257,7 @@
 
 
     # =========================================================
-    # 15. Wait for FortiGate to apply the configuration
+    # 16. Wait for FortiGate to apply the configuration
     # =========================================================
 
     - name: Wait for FortiGate configuration
@@ -240,10 +267,9 @@
 
 
     # =========================================================
-    # 16. Wait for NEW management IP
+    # 17. Wait for NEW management IP
     #
-    # This verifies that the desired IP is actually reachable
-    # before we continue.
+    # ONLY executed when the IP actually changed.
     # =========================================================
 
     - name: Wait for new management IP SSH
@@ -254,32 +280,49 @@
         delay: 2
         timeout: 60
       delegate_to: localhost
-      when: is_target_firewall
+      when:
+        - is_target_firewall
+        - ip_change_required
 
 
     # =========================================================
-    # 17. Update Ansible connection address
+    # 18. Update Ansible connection address
+    #
+    # ONLY executed when the IP actually changed.
     # =========================================================
 
     - name: Update Ansible connection to new management IP
       ansible.builtin.set_fact:
         ansible_host: "{{ target_firewall.management_ip }}"
-      when: is_target_firewall
+      when:
+        - is_target_firewall
+        - ip_change_required
 
 
     # =========================================================
-    # 18. Reset existing SSH connection
+    # 19. Reset existing SSH connection
+    #
+    # ONLY executed when the IP actually changed.
     # =========================================================
 
     - name: Reset SSH connection
       ansible.builtin.meta: reset_connection
+      when:
+        - is_target_firewall
+        - ip_change_required
 
 
     # =========================================================
-    # 19. Verify FortiGate through NEW IP
+    # 20. Verify FortiGate
+    #
+    # If IP didn't change:
+    #     -> verify using existing connection
+    #
+    # If IP changed:
+    #     -> verify using the new IP
     # =========================================================
 
-    - name: Verify FortiGate connectivity on new IP
+    - name: Verify FortiGate connectivity
       ansible.builtin.raw: "get system status"
       register: verification_result
       changed_when: false
@@ -287,7 +330,7 @@
 
 
     # =========================================================
-    # 20. Display verification
+    # 21. Display verification
     # =========================================================
 
     - name: Display FortiGate verification
@@ -297,7 +340,7 @@
 
 
     # =========================================================
-    # 21. Validate final connection
+    # 22. Validate final connection
     #
     # If this fails, the AWX job becomes FAILED and the next
     # workflow node should NOT execute.
@@ -309,9 +352,10 @@
           - verification_result.rc == 0
           - verification_result.stdout is search('Version:')
         fail_msg: >
-          FortiGate verification failed after changing the
-          management IP to {{ target_firewall.management_ip }}.
+          FortiGate verification failed after provisioning.
+          Current management IP: {{ current_management_ip }}
+          Desired management IP: {{ target_firewall.management_ip }}
         success_msg: >
-          FortiGate successfully provisioned and verified on
-          {{ target_firewall.management_ip }}.
+          FortiGate successfully provisioned and verified.
+          Management IP: {{ target_firewall.management_ip }}
       when: is_target_firewall
