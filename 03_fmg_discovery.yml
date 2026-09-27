@@ -1,0 +1,164 @@
+---
+- name: Step 2 - FortiManager FortiGate Discovery
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - ../vars/fortimanager.vars
+
+  vars:
+    fmg_validate_certs: false
+    adom: "dhia"
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN
+    # ============================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 1
+          method: "exec"
+
+          params:
+            - url: "/sys/login/user"
+
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+
+        return_content: true
+
+      register: fmg_login
+      no_log: true
+
+
+    # ============================================================
+    # 2. VERIFY LOGIN
+    # ============================================================
+
+    - name: Verify FortiManager login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json.result is defined
+          - fmg_login.json.result[0].status.code == 0
+          - fmg_login.json.session is defined
+
+        fail_msg: "FortiManager authentication failed."
+
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fmg_session: "{{ fmg_login.json.session }}"
+
+      no_log: true
+
+
+    # ============================================================
+    # 3. DISCOVER DEVICES
+    # ============================================================
+
+    - name: Get FortiGate devices from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fmg_session }}"
+
+          params:
+            - url: "/dvmdb/adom/{{ adom }}/device"
+
+        return_content: true
+
+      register: fmg_devices
+
+
+    # ============================================================
+    # 4. VERIFY DISCOVERY REQUEST
+    # ============================================================
+
+    - name: Verify device discovery
+      ansible.builtin.assert:
+        that:
+          - fmg_devices.json.result is defined
+          - fmg_devices.json.result[0].status.code == 0
+
+        fail_msg: >-
+          FortiManager device discovery failed.
+          Response={{ fmg_devices.json }}
+
+
+    # ============================================================
+    # 5. SAVE DEVICE LIST
+    # ============================================================
+
+    - name: Save discovered FortiGate devices
+      ansible.builtin.set_fact:
+        fortigates: "{{ fmg_devices.json.result[0].data }}"
+
+
+    # ============================================================
+    # 6. DISPLAY RAW DISCOVERY DATA
+    # ============================================================
+
+    - name: Display discovered FortiGate data
+      ansible.builtin.debug:
+        var: fortigates
+
+
+    # ============================================================
+    # 7. DISPLAY DEVICE SUMMARY
+    # ============================================================
+
+    - name: Display FortiGate discovery summary
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "FORTIMANAGER DEVICE DISCOVERY"
+          - "=============================================="
+          - "ADOM       : {{ adom }}"
+          - "Device     : {{ item.name | default('unknown') }}"
+          - "Serial     : {{ item.sn | default('unknown') }}"
+          - "IP         : {{ item.ip | default('unknown') }}"
+          - "OID        : {{ item.oid | default('unknown') }}"
+          - "Status     : {{ item.conn_status | default('unknown') }}"
+          - "Management : {{ item.mgmt_mode | default('unknown') }}"
+          - "=============================================="
+
+      loop: "{{ fortigates }}"
+
+
+    # ============================================================
+    # 8. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 3
+          method: "exec"
+          session: "{{ fmg_session }}"
+
+          params:
+            - url: "/sys/logout"
+
+        return_content: true
+
+      no_log: true

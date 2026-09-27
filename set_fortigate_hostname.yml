@@ -1,0 +1,277 @@
+---
+- name: Set FortiGate hostname in FortiManager
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+    - vars/firewalls.vars
+
+  vars:
+    # ============================================================
+    # SAFETY SWITCH
+    #
+    # false = read/compare only
+    # true  = change hostname
+    # ============================================================
+    perform_change: false
+
+  tasks:
+
+    # ============================================================
+    # 1. Authenticate
+    # ============================================================
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    # ============================================================
+    # 2. Save session
+    # ============================================================
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # 3. Get managed devices
+    # ============================================================
+    - name: Get FortiManager managed devices
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+              fields:
+                - name
+                - sn
+                - ip
+                - mgmt_mode
+                - oid
+        validate_certs: false
+        return_content: true
+      register: devices_response
+      no_log: true
+
+    # ============================================================
+    # 4. Match FortiGates by SERIAL NUMBER
+    # ============================================================
+    - name: Match FortiGates by serial number
+      ansible.builtin.set_fact:
+        firewall_matches: >-
+          {{
+            firewall_matches | default([]) + [
+              {
+                'serial': item.serial,
+                'desired_name': item.hostname,
+                'matches':
+                  devices_response.json.result[0].data
+                  | selectattr('sn', 'equalto', item.serial)
+                  | list
+              }
+            ]
+          }}
+      loop: "{{ firewalls }}"
+      loop_control:
+        label: "{{ item.hostname }} / {{ item.serial }}"
+
+    # ============================================================
+    # 5. Display hostname change plan
+    # ============================================================
+    - name: Display hostname change plan
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.serial }}"
+
+          current_name: >-
+            {{
+              item.matches[0].name
+              if item.matches | length > 0
+              else 'NOT FOUND'
+            }}
+
+          desired_name: "{{ item.desired_name }}"
+
+          action: >-
+            {{
+              'CHANGE NAME'
+              if (
+                item.matches | length > 0
+                and
+                item.matches[0].name != item.desired_name
+              )
+              else
+              (
+                'ALREADY CORRECT'
+                if item.matches | length > 0
+                else 'NOT FOUND'
+              )
+            }}
+
+      loop: "{{ firewall_matches }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    # ============================================================
+    # 6. Change ONLY the FortiManager device name
+    # ============================================================
+    - name: Set FortiManager device hostname
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "set"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device/{{ item.matches[0].name }}"
+              data:
+                name: "{{ item.desired_name }}"
+        validate_certs: false
+        return_content: true
+      loop: "{{ firewall_matches }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when:
+        - perform_change | bool
+        - item.matches | length > 0
+        - item.matches[0].name != item.desired_name
+      register: rename_results
+      no_log: true
+
+    # ============================================================
+    # 7. Get devices again for verification
+    # ============================================================
+    - name: Get devices again for verification
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+              fields:
+                - name
+                - sn
+        validate_certs: false
+        return_content: true
+      register: verification_response
+      no_log: true
+      when: perform_change | bool
+
+    # ============================================================
+    # 8. Build safe verification results
+    # ============================================================
+    - name: Build verification results
+      ansible.builtin.set_fact:
+        verification_results: >-
+          {{
+            verification_results | default([]) + [
+              {
+                'serial': item.serial,
+                'expected_name': item.desired_name,
+                'actual_name':
+                  (
+                    verification_response.json.result[0].data
+                    | selectattr('sn', 'equalto', item.serial)
+                    | map(attribute='name')
+                    | list
+                    | first
+                  )
+                  if (
+                    verification_response.json.result[0].data
+                    | selectattr('sn', 'equalto', item.serial)
+                    | list
+                    | length > 0
+                  )
+                  else 'NOT FOUND'
+              }
+            ]
+          }}
+      loop: "{{ firewall_matches }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when: perform_change | bool
+
+    # ============================================================
+    # 9. Display verification
+    # ============================================================
+    - name: Display hostname verification
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.serial }}"
+          expected_name: "{{ item.expected_name }}"
+          actual_name: "{{ item.actual_name }}"
+          status: >-
+            {{
+              'SUCCESS'
+              if item.actual_name == item.expected_name
+              else
+              (
+                'NOT FOUND'
+                if item.actual_name == 'NOT FOUND'
+                else 'FAILED'
+              )
+            }}
+      loop: "{{ verification_results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when: perform_change | bool
+
+    # ============================================================
+    # 10. Fail ONLY if a found device has the wrong name
+    # ============================================================
+    - name: Fail if hostname verification failed
+      ansible.builtin.fail:
+        msg: >-
+          Hostname verification failed for {{ item.serial }}.
+          Expected "{{ item.expected_name }}",
+          actual "{{ item.actual_name }}".
+      loop: "{{ verification_results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when:
+        - perform_change | bool
+        - item.actual_name != item.expected_name
+        - item.actual_name != 'NOT FOUND'
+
+    # ============================================================
+    # 11. Logout
+    # ============================================================
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+      no_log: true

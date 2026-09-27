@@ -1,0 +1,478 @@
+---
+- name: Step 6 - FortiManager Static Route Management
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - ../vars/fortimanager.vars
+    - ../vars/firewalls.vars
+
+  vars:
+    fmg_validate_certs: false
+    adom: "root"
+
+    # ==========================================================
+    # DESIRED STATIC ROUTE
+    # ==========================================================
+
+    static_route:
+      destination: "10.10.50.0/24"
+      gateway: "192.168.101.2"
+      interface: "port1"
+      vdom: "root"
+      distance: 10
+      priority: 0
+
+  tasks:
+
+    # ==========================================================
+    # 1. LOGIN
+    # ==========================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        return_content: true
+      register: fmg_login
+      no_log: true
+
+    - name: Verify FortiManager login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json.result is defined
+          - fmg_login.json.result[0].status.code == 0
+          - fmg_login.json.session is defined
+        fail_msg: "FortiManager authentication failed."
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fmg_session: "{{ fmg_login.json.session }}"
+      no_log: true
+
+
+    # ==========================================================
+    # 2. DISCOVER FORTIGATES
+    # ==========================================================
+
+    - name: Get FortiGate devices from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/dvmdb/adom/{{ adom }}/device"
+        return_content: true
+      register: fmg_devices
+      no_log: true
+
+    - name: Verify device discovery
+      ansible.builtin.assert:
+        that:
+          - fmg_devices.json.result is defined
+          - fmg_devices.json.result[0].status.code == 0
+          - fmg_devices.json.result[0].data is defined
+        fail_msg: "Unable to retrieve FortiGate devices."
+
+    - name: Save managed devices
+      ansible.builtin.set_fact:
+        managed_devices: "{{ fmg_devices.json.result[0].data }}"
+
+
+    # ==========================================================
+    # 3. MATCH FIREWALLS BY SERIAL
+    # ==========================================================
+
+    - name: Build firewall targets
+      ansible.builtin.set_fact:
+        firewall_targets: >-
+          {{
+            firewall_targets | default([]) +
+            [
+              {
+                'serial': item.serial,
+                'device_name': item.hostname,
+                'management_ip': item.management_ip,
+                'device':
+                  (
+                    (
+                      managed_devices
+                      | selectattr('sn', 'defined')
+                      | selectattr('sn', 'equalto', item.serial)
+                      | list
+                    )
+                    | first
+                    | default(none, true)
+                  )
+              }
+            ]
+          }}
+      loop: "{{ firewalls }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+    # ==========================================================
+    # 4. DISPLAY TARGETS
+    # ==========================================================
+
+    - name: Display static route targets
+      ansible.builtin.debug:
+        msg:
+          - "----------------------------------------------"
+          - "STATIC ROUTE TARGET"
+          - "----------------------------------------------"
+          - "Serial       : {{ item.serial }}"
+          - "Device       : {{ item.device_name }}"
+          - "Management IP: {{ item.management_ip }}"
+          - "Status       : {{ 'FOUND' if item.device is not none else 'NOT FOUND - SKIP' }}"
+          - "----------------------------------------------"
+      loop: "{{ firewall_targets }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+    # ==========================================================
+    # 5. DISPLAY DESIRED ROUTE
+    # ==========================================================
+
+    - name: Display desired static route
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "DESIRED STATIC ROUTE"
+          - "=============================================="
+          - "Destination : {{ static_route.destination }}"
+          - "Gateway     : {{ static_route.gateway }}"
+          - "Interface   : {{ static_route.interface }}"
+          - "VDOM        : {{ static_route.vdom }}"
+          - "Distance    : {{ static_route.distance }}"
+          - "Priority    : {{ static_route.priority }}"
+          - "=============================================="
+
+
+    # ==========================================================
+    # 6. GET EXISTING STATIC ROUTES
+    #
+    # IMPORTANT:
+    # FortiManager device configuration endpoint:
+    #
+    # /pm/config/device/<device>/vdom/<vdom>/...
+    # ==========================================================
+
+    - name: Get device static routes
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 10
+          method: "get"
+          session: "{{ fmg_session }}"
+          params:
+            - url: >-
+                /pm/config/device/{{ item.device_name }}/vdom/{{ static_route.vdom }}/router/static
+        return_content: true
+      register: route_results
+      no_log: true
+      loop: "{{ firewall_targets }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when:
+        - item.device is not none
+
+
+    # ==========================================================
+    # 7. VERIFY ROUTE DISCOVERY
+    # ==========================================================
+
+    - name: Verify route discovery
+      ansible.builtin.assert:
+        that:
+          - item.json.result is defined
+          - item.json.result[0].status.code == 0
+        fail_msg: >-
+          Failed to retrieve static routes for
+          {{ item.item.device_name }}.
+      loop: "{{ route_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial }}"
+      when:
+        - not (item.skipped | default(false))
+
+
+    # ==========================================================
+    # 8. BUILD CURRENT ROUTE STATE
+    # ==========================================================
+
+    - name: Build route status
+      ansible.builtin.set_fact:
+        route_targets: >-
+          {{
+            route_targets | default([]) +
+            [
+              {
+                'serial': item.item.serial,
+                'device_name': item.item.device_name,
+                'routes': item.json.result[0].data | default([])
+              }
+            ]
+          }}
+      loop: "{{ route_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial }}"
+      when:
+        - not (item.skipped | default(false))
+
+
+    # ==========================================================
+    # 9. DISPLAY CURRENT ROUTES
+    # ==========================================================
+
+    - name: Display current routes
+      ansible.builtin.debug:
+        msg:
+          - "----------------------------------------------"
+          - "CURRENT STATIC ROUTES"
+          - "----------------------------------------------"
+          - "Device : {{ item.device_name }}"
+          - "Serial : {{ item.serial }}"
+          - "Routes : {{ item.routes }}"
+          - "----------------------------------------------"
+      loop: "{{ route_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+    # ==========================================================
+    # 10. DETERMINE IF DESIRED ROUTE EXISTS
+    #
+    # FortiManager can return:
+    #
+    # dst: [ "10.10.50.0", "255.255.255.0" ]
+    #
+    # Therefore we compare destination + mask.
+    # ==========================================================
+
+    - name: Determine route compliance
+      ansible.builtin.set_fact:
+        route_compliance: >-
+          {{
+            route_compliance | default([]) +
+            [
+              {
+                'serial': item.serial,
+                'device_name': item.device_name,
+                'route_exists':
+                  (
+                    item.routes
+                    | selectattr('dst', 'defined')
+                    | selectattr(
+                        'dst',
+                        'equalto',
+                        [
+                          static_route.destination.split('/')[0],
+                          '255.255.255.0'
+                        ]
+                      )
+                    | list
+                    | length
+                  ) > 0
+              }
+            ]
+          }}
+      loop: "{{ route_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+    # ============================================================
+    # 11. DISPLAY COMPLIANCE
+    # ============================================================
+
+    - name: Display route compliance
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "STATIC ROUTE COMPLIANCE"
+          - "=============================================="
+          - "Device       : {{ item.device_name }}"
+          - "Serial       : {{ item.serial }}"
+          - "Destination  : {{ static_route.destination }}"
+          - "Route exists : {{ item.route_exists }}"
+          - "=============================================="
+      loop: "{{ route_compliance | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+
+    # ============================================================
+    # 12. CREATE ROUTE IF MISSING
+    # ============================================================
+
+    - name: Create missing static route
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 20
+          method: "add"
+          session: "{{ fmg_session }}"
+          params:
+            - url: >-
+                /pm/config/device/{{ item.device_name }}/vdom/{{ static_route.vdom }}/router/static
+              data:
+                dst:
+                  - "{{ static_route.destination.split('/')[0] }}"
+                  - "255.255.255.0"
+                gateway: "{{ static_route.gateway }}"
+                device: "{{ static_route.interface }}"
+                distance: "{{ static_route.distance }}"
+                priority: "{{ static_route.priority }}"
+        return_content: true
+      register: create_route_results
+      no_log: true
+      loop: "{{ route_compliance | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when:
+        - not item.route_exists
+
+
+    # ============================================================
+    # 13. VERIFY ROUTE CREATION
+    # ============================================================
+
+    - name: Verify static route creation
+      ansible.builtin.assert:
+        that:
+          - item.json.result is defined
+          - item.json.result[0].status.code == 0
+        fail_msg: >-
+          Static route creation failed for
+          {{ item.item.device_name }}.
+      loop: "{{ create_route_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial }}"
+      when:
+        - not (item.skipped | default(false))
+
+
+    # ============================================================
+    # 14. REFRESH STATIC ROUTES
+    # ============================================================
+
+    - name: Refresh static routes
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 30
+          method: "get"
+          session: "{{ fmg_session }}"
+          params:
+            - url: >-
+                /pm/config/device/{{ item.device_name }}/vdom/{{ static_route.vdom }}/router/static
+        return_content: true
+      register: refreshed_route_results
+      no_log: true
+      loop: "{{ firewall_targets }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when:
+        - item.device is not none
+
+
+    # ============================================================
+    # 15. VERIFY FINAL ROUTE
+    # ============================================================
+
+    - name: Verify final static route
+      ansible.builtin.assert:
+        that:
+          - matching_routes | length > 0
+        fail_msg: >-
+          Static route {{ static_route.destination }}
+          was not found for {{ item.item.device_name }}.
+        success_msg: >-
+          Static route {{ static_route.destination }}
+          verified for {{ item.item.device_name }}.
+      vars:
+        matching_routes: >-
+          {{
+            item.json.result[0].data
+            | selectattr('dst', 'defined')
+            | selectattr(
+                'dst',
+                'equalto',
+                [
+                  static_route.destination.split('/')[0],
+                  '255.255.255.0'
+                ]
+              )
+            | list
+          }}
+      loop: "{{ refreshed_route_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial }}"
+      when:
+        - not (item.skipped | default(false))
+
+
+    # ============================================================
+    # 16. FINAL SUMMARY
+    # ============================================================
+
+    - name: Display Step 6 summary
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "STEP 6 - STATIC ROUTE SUMMARY"
+          - "=============================================="
+          - "Destination : {{ static_route.destination }}"
+          - "Gateway     : {{ static_route.gateway }}"
+          - "Interface   : {{ static_route.interface }}"
+          - "VDOM        : {{ static_route.vdom }}"
+          - "=============================================="
+          - "Static route automation completed."
+          - "=============================================="
+
+
+    # ============================================================
+    # 17. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+        body:
+          id: 99
+          method: "exec"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/sys/logout"
+        return_content: true
+      no_log: true

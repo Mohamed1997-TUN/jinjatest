@@ -1,0 +1,93 @@
+---
+- name: Step 1 - FortiManager API Login Test
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - ../vars/fortimanager.vars
+
+  vars:
+    fmg_validate_certs: false
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN TO FORTIMANAGER
+    # ============================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 1
+          method: "exec"
+
+          params:
+            - url: "/sys/login/user"
+
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+
+        return_content: true
+
+      register: fmg_login
+      no_log: false
+
+
+    # ============================================================
+    # 2. VERIFY LOGIN
+    # ============================================================
+
+    - name: Verify FortiManager login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json.result is defined
+          - fmg_login.json.result[0].status.code == 0
+          - fmg_login.json.session is defined
+
+        fail_msg: "FortiManager authentication failed."
+
+        success_msg: "FortiManager authentication successful."
+
+
+    # ============================================================
+    # 3. DISPLAY SAFE INFORMATION
+    # ============================================================
+
+    - name: Display FortiManager connection information
+      ansible.builtin.debug:
+        msg:
+          - "FortiManager : {{ fortimanager_host }}"
+          - "User         : {{ fortimanager_user }}"
+          - "API          : JSON-RPC"
+          - "Login        : SUCCESS"
+          - "Session      : Created"
+
+
+    # ============================================================
+    # 4. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 2
+          method: "exec"
+          session: "{{ fmg_login.json.session }}"
+
+          params:
+            - url: "/sys/logout"
+
+        return_content: true
+
+      no_log: true

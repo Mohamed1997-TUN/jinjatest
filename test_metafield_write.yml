@@ -1,0 +1,162 @@
+---
+- name: Test FortiManager Device VDOM Meta Field
+  hosts: fortimanager
+  gather_facts: false
+
+  vars:
+    fmg_url: "https://192.168.101.5"
+
+    # FortiManager objects
+    fmg_adom: "root"
+    fmg_device: "dhia-staline"
+    fmg_vdom: "root"
+
+    # Existing Meta Field
+    metafield_name: "fgt_route_destination"
+
+    # TEST value
+    test_value: "10.10.80.0"
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN
+    # ============================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_url }}/jsonrpc"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ ansible_user }}"
+                passwd: "{{ ansible_password }}"
+        return_content: true
+      register: fmg_login
+      no_log: true
+
+    - name: Extract FortiManager session
+      ansible.builtin.set_fact:
+        fmg_session: "{{ fmg_login.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # 2. READ CURRENT VDOM META FIELDS
+    # ============================================================
+
+    - name: Read current Device VDOM Meta Fields
+      ansible.builtin.uri:
+        url: "{{ fmg_url }}/jsonrpc"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/dvmdb/adom/{{ fmg_adom }}/device/{{ fmg_device }}/vdom"
+              fields:
+                - name
+                - oid
+                - "meta fields"
+              option:
+                - "get meta"
+        return_content: true
+      register: metafield_get_before
+
+    - name: Display current Meta Fields
+      ansible.builtin.debug:
+        var: metafield_get_before.json
+
+    # ============================================================
+    # 3. SET META FIELD
+    #
+    # IMPORTANT:
+    # We are using the parent DEVICE endpoint here:
+    #
+    # /dvmdb/adom/root/device/dhia-staline
+    #
+    # Instead of:
+    #
+    # /dvmdb/adom/root/device/dhia-staline/vdom/root
+    #
+    # ============================================================
+
+    - name: Set Device VDOM Meta Field through device object
+      ansible.builtin.uri:
+        url: "{{ fmg_url }}/jsonrpc"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          id: 3
+          method: "set"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/dvmdb/adom/{{ fmg_adom }}/device/{{ fmg_device }}"
+              data:
+                vdom:
+                  - name: "{{ fmg_vdom }}"
+                    meta fields:
+                      "{{ metafield_name }}": "{{ test_value }}"
+        return_content: true
+      register: metafield_set
+
+    - name: Display Meta Field write result
+      ansible.builtin.debug:
+        var: metafield_set.json
+
+    # ============================================================
+    # 4. VERIFY THE VALUE
+    # ============================================================
+
+    - name: Read Meta Fields after write
+      ansible.builtin.uri:
+        url: "{{ fmg_url }}/jsonrpc"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/dvmdb/adom/{{ fmg_adom }}/device/{{ fmg_device }}/vdom"
+              fields:
+                - name
+                - oid
+                - "meta fields"
+              option:
+                - "get meta"
+        return_content: true
+      register: metafield_get_after
+
+    - name: Display Meta Fields after write
+      ansible.builtin.debug:
+        var: metafield_get_after.json
+
+    # ============================================================
+    # 5. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_url }}/jsonrpc"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          id: 5
+          method: "exec"
+          session: "{{ fmg_session }}"
+          params:
+            - url: "/sys/logout"
+        return_content: true
+      no_log: true

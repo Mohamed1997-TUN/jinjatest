@@ -1,0 +1,53 @@
+---
+- name: Query FortiManager devices
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  tasks:
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Get FortiManager managed devices
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+        validate_certs: false
+        return_content: true
+      register: devices_response
+      no_log: true
+
+    - name: Display managed devices
+      ansible.builtin.debug:
+        var: devices_response.json

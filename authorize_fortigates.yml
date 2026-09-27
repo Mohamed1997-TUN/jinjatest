@@ -1,0 +1,308 @@
+---
+- name: Authorize FortiGates in FortiManager
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+    - vars/firewalls.vars
+
+  vars:
+    target_adom: "root"
+
+    # false = discovery only
+    # true  = authorize
+    perform_change: false
+
+  tasks:
+
+    # ============================================================
+    # 1. Authenticate
+    # ============================================================
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # 2. Get devices from FortiManager
+    # ============================================================
+    - name: Get FortiManager devices
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+              fields:
+                - name
+                - sn
+                - ip
+                - mgmt_mode
+                - oid
+        validate_certs: false
+        return_content: true
+      register: devices_response
+      no_log: true
+
+    # ============================================================
+    # 3. Select unauthorized devices
+    #
+    # On this FortiManager response, mgmt_mode=0 corresponds
+    # to the unauthorized/unregistered device returned by DVMDB.
+    #
+    # We will additionally match against our approved serial list.
+    # ============================================================
+    - name: Find approved unauthorized FortiGates
+      ansible.builtin.set_fact:
+        approved_unauthorized_devices: >-
+          {{
+            devices_response.json.result[0].data
+            | default([])
+            | selectattr(
+                'sn',
+                'in',
+                firewalls | map(attribute='serial') | list
+              )
+            | selectattr('mgmt_mode', 'equalto', 0)
+            | list
+          }}
+
+    # ============================================================
+    # 4. Display authorization plan
+    # ============================================================
+    - name: Display authorization plan
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.sn }}"
+          current_name: "{{ item.name }}"
+          desired_name: >-
+            {{
+              firewalls
+              | selectattr('serial', 'equalto', item.sn)
+              | map(attribute='hostname')
+              | list
+              | first
+            }}
+          target_adom: "{{ target_adom }}"
+          action: "AUTHORIZE"
+
+      loop: "{{ approved_unauthorized_devices }}"
+      loop_control:
+        label: "{{ item.sn }}"
+
+    # ============================================================
+    # 5. Authorize / Promote
+    #
+    # FortiManager API:
+    # /dvm/cmd/add/device
+    #
+    # device action = promote_unreg
+    # ============================================================
+    - name: Authorize FortiGate
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvm/cmd/add/device"
+              data:
+                adom: "{{ target_adom }}"
+                device:
+                  device action: "promote_unreg"
+                  name: "{{ item.name }}"
+                flags:
+                  - "create_task"
+        validate_certs: false
+        return_content: true
+      loop: "{{ approved_unauthorized_devices }}"
+      loop_control:
+        label: "{{ item.sn }}"
+      register: authorization_results
+      no_log: true
+      when:
+        - perform_change | bool
+        - approved_unauthorized_devices | length > 0
+
+    # ============================================================
+    # 6. Extract task IDs
+    # ============================================================
+    - name: Extract authorization task IDs
+      ansible.builtin.set_fact:
+        authorization_tasks: >-
+          {{
+            authorization_tasks | default([]) + [
+              {
+                'serial': item.item.sn,
+                'device_name': item.item.name,
+                'taskid': item.json.result[0].data.taskid
+              }
+            ]
+          }}
+      loop: "{{ authorization_results.results | default([]) }}"
+      when:
+        - perform_change | bool
+        - item.json.result is defined
+        - item.json.result[0].data.taskid is defined
+
+    # ============================================================
+    # 7. Display task IDs
+    # ============================================================
+    - name: Display authorization task IDs
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.serial }}"
+          device: "{{ item.device_name }}"
+          taskid: "{{ item.taskid }}"
+      loop: "{{ authorization_tasks | default([]) }}"
+      when: perform_change | bool
+
+    # ============================================================
+    # 8. Wait for authorization tasks
+    # ============================================================
+    - name: Wait for FortiManager authorization task
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - perform_change | bool
+        - authorization_tasks | default([]) | length > 0
+
+    # ============================================================
+    # 9. Check authorization task
+    # ============================================================
+    - name: Check authorization task
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/task/task/{{ item.taskid }}"
+        validate_certs: false
+        return_content: true
+      loop: "{{ authorization_tasks | default([]) }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      register: task_results
+      no_log: true
+      when: perform_change | bool
+
+    # ============================================================
+    # 10. Display task status
+    # ============================================================
+    - name: Display authorization task status
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.item.serial }}"
+          taskid: "{{ item.item.taskid }}"
+          state: "{{ item.json.result[0].data.state | default('UNKNOWN') }}"
+          percent: "{{ item.json.result[0].data.percent | default('UNKNOWN') }}"
+          errors: "{{ item.json.result[0].data.num_err | default('UNKNOWN') }}"
+      loop: "{{ task_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial }}"
+      when: perform_change | bool
+
+    # ============================================================
+    # 11. Get devices again
+    # ============================================================
+    - name: Get devices after authorization
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+              fields:
+                - name
+                - sn
+                - ip
+                - mgmt_mode
+        validate_certs: false
+        return_content: true
+      register: verification_response
+      no_log: true
+      when: perform_change | bool
+
+    # ============================================================
+    # 12. Verify authorization
+    # ============================================================
+    - name: Verify FortiGate authorization
+      ansible.builtin.debug:
+        msg:
+          serial: "{{ item.serial }}"
+          expected_name: "{{ item.hostname }}"
+          status: >-
+            {{
+              'AUTHORIZED'
+              if (
+                verification_response.json.result[0].data
+                | selectattr('sn', 'equalto', item.serial)
+                | list
+                | length > 0
+                and
+                (
+                  verification_response.json.result[0].data
+                  | selectattr('sn', 'equalto', item.serial)
+                  | map(attribute='mgmt_mode')
+                  | list
+                  | first
+                ) != 0
+              )
+              else 'NOT AUTHORIZED'
+            }}
+      loop: "{{ firewalls }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      when: perform_change | bool
+
+    # ============================================================
+    # 13. Logout
+    # ============================================================
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 6
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+      no_log: true

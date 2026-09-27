@@ -1,0 +1,149 @@
+---
+- name: Test FortiManager VDOM Meta Field UPDATE
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    target_adom: "root"
+    target_device: "dhia-staline-automation"
+    target_vdom: "root"
+
+    meta_field_name: "fgt_route_destination"
+    meta_field_value: "10.10.60.0"
+
+  tasks:
+
+    # ============================================================
+    # LOGIN
+    # ============================================================
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # UPDATE META FIELD
+    # ============================================================
+
+    - name: Update Device VDOM Meta Field
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "update"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: >-
+                /dvmdb/adom/{{ target_adom }}/device/{{ target_device }}/vdom/{{ target_vdom }}
+              data:
+                meta fields:
+                  "{{ meta_field_name }}": "{{ meta_field_value }}"
+        validate_certs: false
+        return_content: true
+      register: update_response
+      no_log: true
+
+    # ============================================================
+    # DISPLAY RESULT
+    # ============================================================
+
+    - name: Display UPDATE result
+      ansible.builtin.debug:
+        var: update_response.json
+
+    # ============================================================
+    # VERIFY API RESULT
+    # ============================================================
+
+    - name: Verify UPDATE operation
+      ansible.builtin.assert:
+        that:
+          - update_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          FortiManager rejected the UPDATE operation.
+        success_msg: >-
+          FortiManager accepted the UPDATE operation.
+
+    # ============================================================
+    # READ BACK VALUE
+    # ============================================================
+
+    - name: Read VDOM Meta Field
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: >-
+                /dvmdb/adom/{{ target_adom }}/device/{{ target_device }}/vdom/{{ target_vdom }}
+              option:
+                - "get meta"
+              fields:
+                - "name"
+                - "meta fields"
+        validate_certs: false
+        return_content: true
+      register: verify_response
+      no_log: true
+
+    - name: Display final value
+      ansible.builtin.debug:
+        msg:
+          device: "{{ target_device }}"
+          vdom: "{{ target_vdom }}"
+          meta_field: "{{ meta_field_name }}"
+          expected: "{{ meta_field_value }}"
+          actual: >-
+            {{
+              verify_response.json.result[0].data['meta fields'][meta_field_name]
+              | default('NOT FOUND')
+            }}
+
+    # ============================================================
+    # LOGOUT
+    # ============================================================
+
+    - name: Logout
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+        return_content: true
+      no_log: true

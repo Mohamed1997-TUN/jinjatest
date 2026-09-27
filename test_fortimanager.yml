@@ -1,0 +1,57 @@
+---
+- name: Test FortiManager authentication
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  tasks:
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Verify session exists
+      ansible.builtin.debug:
+        msg: "FortiManager authentication successful. Session received."
+
+    - name: Query FortiManager system status
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/status"
+        validate_certs: false
+        return_content: true
+      register: status_response
+      no_log: true
+
+    - name: Display FortiManager status
+      ansible.builtin.debug:
+        var: status_response.json

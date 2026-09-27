@@ -1,0 +1,286 @@
+---
+- name: Inspect existing FortiManager policy package
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    target_adom: "root"
+    target_package: "dhia-staline"
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN
+    # ============================================================
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Confirm authentication
+      ansible.builtin.debug:
+        msg: "FortiManager authentication successful."
+
+
+    # ============================================================
+    # 2. GET ALL POLICY PACKAGES
+    # ============================================================
+
+    - name: Get policy packages
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}"
+        validate_certs: false
+        return_content: true
+      register: packages_response
+      no_log: true
+
+    - name: Extract policy package list
+      ansible.builtin.set_fact:
+        policy_packages: >-
+          {{
+            packages_response.json.result[0].data
+            | default([])
+          }}
+
+    - name: Display available policy packages
+      ansible.builtin.debug:
+        msg:
+          - "ADOM: {{ target_adom }}"
+          - "Available policy packages:"
+          - "{{ policy_packages | map(attribute='name') | list }}"
+
+
+    # ============================================================
+    # 3. CHECK THAT DHIA-STALINE EXISTS
+    # ============================================================
+
+    - name: Check target policy package
+      ansible.builtin.set_fact:
+        target_package_data: >-
+          {{
+            policy_packages
+            | selectattr('name', 'equalto', target_package)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Display target package status
+      ansible.builtin.debug:
+        msg:
+          - "Target package: {{ target_package }}"
+          - "Found: {{ target_package_data | length > 0 }}"
+
+    - name: Stop if target package does not exist
+      ansible.builtin.fail:
+        msg: >-
+          Policy package '{{ target_package }}' was not found
+          in ADOM '{{ target_adom }}'.
+      when: target_package_data | length == 0
+
+
+    # ============================================================
+    # 4. GET POLICY PACKAGE DETAILS
+    # ============================================================
+
+    - name: Get policy package details
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}/{{ target_package }}"
+        validate_certs: false
+        return_content: true
+      register: package_details_response
+      no_log: true
+
+    - name: Extract policy package details
+      ansible.builtin.set_fact:
+        package_details: >-
+          {{
+            package_details_response.json.result[0].data
+            | default([])
+          }}
+
+    - name: Display policy package details
+      ansible.builtin.debug:
+        var: package_details
+
+
+    # ============================================================
+    # 5. GET INSTALLATION TARGETS
+    # ============================================================
+
+    - name: Get policy package installation targets
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}/{{ target_package }}/scope member"
+        validate_certs: false
+        return_content: true
+      register: installation_targets_response
+      no_log: true
+
+    - name: Extract installation targets
+      ansible.builtin.set_fact:
+        installation_targets: >-
+          {{
+            installation_targets_response.json.result[0].data
+            | default([])
+          }}
+
+    - name: Display installation targets
+      ansible.builtin.debug:
+        msg:
+          - "Policy package: {{ target_package }}"
+          - "Installation targets:"
+          - "{{ installation_targets }}"
+
+
+    # ============================================================
+    # 6. GET FIREWALL POLICIES
+    # ============================================================
+
+    - name: Get firewall policies from policy package
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/config/adom/{{ target_adom }}/pkg/{{ target_package }}/firewall/policy"
+              fields:
+                - "policyid"
+                - "name"
+                - "srcintf"
+                - "dstintf"
+                - "srcaddr"
+                - "dstaddr"
+                - "service"
+                - "action"
+                - "status"
+                - "schedule"
+                - "logtraffic"
+        validate_certs: false
+        return_content: true
+      register: firewall_policies_response
+      no_log: true
+
+    - name: Extract firewall policies
+      ansible.builtin.set_fact:
+        firewall_policies: >-
+          {{
+            firewall_policies_response.json.result[0].data
+            | default([])
+          }}
+
+    - name: Display firewall policies
+      ansible.builtin.debug:
+        msg:
+          - "Policy package: {{ target_package }}"
+          - "Firewall policies:"
+          - "{{ firewall_policies }}"
+
+
+    # ============================================================
+    # 7. DISPLAY FINAL SUMMARY
+    # ============================================================
+
+    - name: Build package summary
+      ansible.builtin.set_fact:
+        package_summary:
+          adom: "{{ target_adom }}"
+          package: "{{ target_package }}"
+          package_oid: "{{ target_package_data.oid | default('N/A') }}"
+          package_type: "{{ target_package_data.type | default('N/A') }}"
+          installation_targets: "{{ installation_targets }}"
+          firewall_policy_count: "{{ firewall_policies | length }}"
+
+    - name: Display final policy package summary
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "FORTIMANAGER POLICY PACKAGE SUMMARY"
+          - "=============================================="
+          - "ADOM: {{ package_summary.adom }}"
+          - "Package: {{ package_summary.package }}"
+          - "OID: {{ package_summary.package_oid }}"
+          - "Type: {{ package_summary.package_type }}"
+          - "Installation Targets:"
+          - "{{ package_summary.installation_targets }}"
+          - "Firewall Policy Count: {{ package_summary.firewall_policy_count }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 8. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 6
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+        return_content: true
+      register: logout_response
+      no_log: true
+
+    - name: Confirm logout
+      ansible.builtin.debug:
+        msg: "FortiManager session closed."

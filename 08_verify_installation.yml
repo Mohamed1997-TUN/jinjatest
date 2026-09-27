@@ -1,0 +1,876 @@
+---
+# ============================================================
+# STEP 7 - VERIFY FORTIMANAGER POLICY PACKAGE INSTALLATION
+# ============================================================
+#
+# ADOM:
+#   dhia
+#
+# Target:
+#   Device         : dhia-staline
+#   Serial         : FGVMEVP1_E5VM0ED
+#   Policy package : dhia_staline
+#   VDOM           : root
+#
+# ============================================================
+
+- name: Step 7 - Verify FortiManager Policy Package Installation
+  hosts: localhost
+  gather_facts: false
+
+  # ==========================================================
+  # VARIABLES
+  # ==========================================================
+
+  vars_files:
+    - ../vars/secrets.yml
+    - ../vars/fortimanager.vars
+    - ../vars/firewalls.vars
+
+  vars:
+
+    fmg_validate_certs: false
+
+    adom: "dhia"
+
+
+  tasks:
+
+    # ========================================================
+    # 1. LOGIN
+    # ========================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 1
+
+          method: "exec"
+
+          params:
+
+            - url: "/sys/login/user"
+
+              data:
+
+                user: "{{ fortimanager_user }}"
+
+                passwd: "{{ fortimanager_password }}"
+
+          session: null
+
+          verbose: 1
+
+        return_content: true
+
+      register: fmg_login
+
+      failed_when:
+
+        - fmg_login.status != 200
+
+        - >
+          fmg_login.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+      no_log: true
+
+
+    # ========================================================
+    # 2. SAVE SESSION
+    # ========================================================
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+
+        fmg_session: "{{ fmg_login.json.session }}"
+
+
+    # ========================================================
+    # 3. DISPLAY LOGIN STATUS
+    # ========================================================
+
+    - name: Display login status
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=============================================="
+
+          - "STEP 7 - INSTALLATION VERIFICATION"
+
+          - "=============================================="
+
+          - "FortiManager : {{ fortimanager_host }}"
+
+          - "ADOM         : {{ adom }}"
+
+          - "Login        : SUCCESS"
+
+          - "=============================================="
+
+
+    # ========================================================
+    # 4. LOAD FIREWALL CONFIGURATION
+    # ========================================================
+
+    - name: Initialize verification targets
+      ansible.builtin.set_fact:
+
+        verification_targets: []
+
+
+    # ========================================================
+    # 5. BUILD VERIFICATION TARGETS
+    # ========================================================
+    #
+    # Only firewalls having policy_package are verified.
+    #
+    # ========================================================
+
+    - name: Build verification targets
+      ansible.builtin.set_fact:
+
+        verification_targets: >-
+          {{
+            verification_targets +
+            [
+              {
+                'serial': item.serial,
+                'hostname': item.hostname,
+                'policy_package': item.policy_package,
+                'vdom': item.vdom | default('root'),
+                'management_ip': item.management_ip
+              }
+            ]
+          }}
+
+      loop: "{{ firewalls }}"
+
+      when:
+
+        - item.policy_package | default('') | length > 0
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 6. DISPLAY VERIFICATION TARGETS
+    # ========================================================
+
+    - name: Display verification targets
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=============================================="
+
+          - "VERIFICATION TARGET"
+
+          - "=============================================="
+
+          - "Hostname       : {{ item.hostname }}"
+
+          - "Serial         : {{ item.serial }}"
+
+          - "Management IP  : {{ item.management_ip }}"
+
+          - "Policy package : {{ item.policy_package }}"
+
+          - "VDOM           : {{ item.vdom }}"
+
+          - "=============================================="
+
+      loop: "{{ verification_targets }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 7. QUERY FORTIGATE DEVICES
+    # ========================================================
+
+    - name: Get FortiGate devices from ADOM
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 2
+
+          method: "get"
+
+          params:
+
+            - url: "/dvmdb/adom/{{ adom }}/device"
+
+          session: "{{ fmg_session }}"
+
+          verbose: 1
+
+        return_content: true
+
+      register: managed_devices_response
+
+      failed_when:
+
+        - managed_devices_response.status != 200
+
+        - >
+          managed_devices_response.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+
+    # ========================================================
+    # 8. SAVE DEVICES
+    # ========================================================
+
+    - name: Save managed devices
+      ansible.builtin.set_fact:
+
+        managed_devices: >-
+          {{
+            managed_devices_response.json.result[0].data
+            | default([])
+          }}
+
+
+    # ========================================================
+    # 9. DISPLAY DEVICE COUNT
+    # ========================================================
+
+    - name: Display discovered device count
+      ansible.builtin.debug:
+
+        msg:
+
+          - "FortiGates discovered in ADOM '{{ adom }}':"
+
+          - "{{ managed_devices | length }}"
+
+
+    # ========================================================
+    # 10. INITIALIZE DEVICE VERIFICATION
+    # ========================================================
+
+    - name: Initialize device verification results
+      ansible.builtin.set_fact:
+
+        device_verification_results: []
+
+
+    # ========================================================
+    # 11. VERIFY DEVICE
+    # ========================================================
+
+    - name: Verify FortiGate device
+      ansible.builtin.set_fact:
+
+        device_verification_results: >-
+          {{
+            device_verification_results +
+            [
+              {
+                'hostname': item.hostname,
+                'serial': item.serial,
+                'expected_vdom': item.vdom,
+                'policy_package': item.policy_package,
+                'device_found': device_found,
+                'fmg_name': fmg_name,
+                'fmg_serial': fmg_serial,
+                'vdom_found': vdom_found,
+                'conf_status': conf_status,
+                'conn_status': conn_status,
+                'db_status': db_status
+              }
+            ]
+          }}
+
+      vars:
+
+        device_found: >-
+          {%- set ns = namespace(found=false) -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.found = true -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.found }}
+
+
+        fmg_name: >-
+          {%- set ns = namespace(name='') -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.name = device.name -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.name }}
+
+
+        fmg_serial: >-
+          {%- set ns = namespace(serial='') -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.serial = device.sn -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.serial }}
+
+
+        vdom_found: >-
+          {%- set ns = namespace(found=false) -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- for vdom in device.vdom | default([]) -%}
+
+                {%- if vdom.name == item.vdom -%}
+
+                  {%- set ns.found = true -%}
+
+                {%- endif -%}
+
+              {%- endfor -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.found }}
+
+
+        conf_status: >-
+          {%- set ns = namespace(status='') -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.status = device.conf_status | default('unknown') -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.status }}
+
+
+        conn_status: >-
+          {%- set ns = namespace(status='') -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.status = device.conn_status | default('unknown') -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.status }}
+
+
+        db_status: >-
+          {%- set ns = namespace(status='') -%}
+
+          {%- for device in managed_devices -%}
+
+            {%- if device.sn == item.serial -%}
+
+              {%- set ns.status = device.db_status | default('unknown') -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.status }}
+
+
+      loop: "{{ verification_targets }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 12. DISPLAY DEVICE VERIFICATION
+    # ========================================================
+
+    - name: Display device verification
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=============================================="
+
+          - "DEVICE VERIFICATION"
+
+          - "=============================================="
+
+          - "Configured hostname : {{ item.hostname }}"
+
+          - "Expected serial     : {{ item.serial }}"
+
+          - "FMG device name     : {{ item.fmg_name }}"
+
+          - "FMG serial          : {{ item.fmg_serial }}"
+
+          - "Device found        : {{ item.device_found }}"
+
+          - "VDOM found          : {{ item.vdom_found }}"
+
+          - "Connection status   : {{ item.conn_status }}"
+
+          - "Configuration       : {{ item.conf_status }}"
+
+          - "Database status     : {{ item.db_status }}"
+
+          - "Policy package      : {{ item.policy_package }}"
+
+          - "=============================================="
+
+      loop: "{{ device_verification_results }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 13. VERIFY DEVICE
+    # ========================================================
+
+    - name: Assert FortiGate device verification
+      ansible.builtin.assert:
+
+        that:
+
+          - item.device_found | bool
+
+          - item.fmg_serial == item.serial
+
+          - item.vdom_found | bool
+
+        fail_msg: >-
+
+          FortiGate verification FAILED.
+
+          Hostname={{ item.hostname }}
+
+          Expected serial={{ item.serial }}
+
+          FMG serial={{ item.fmg_serial }}
+
+          Device found={{ item.device_found }}
+
+          VDOM found={{ item.vdom_found }}
+
+        success_msg: >-
+
+          FortiGate '{{ item.hostname }}'
+          verified successfully.
+
+          Serial={{ item.fmg_serial }}
+
+          VDOM={{ item.expected_vdom }}
+
+      loop: "{{ device_verification_results }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 14. VERIFY CONNECTION / CONFIGURATION STATE
+    # ========================================================
+    #
+    # FortiManager device data exposes:
+    #
+    #   conn_status
+    #   conf_status
+    #   db_status
+    #
+    # We verify the expected healthy values.
+    #
+    # ========================================================
+
+    - name: Verify FortiManager device state
+      ansible.builtin.assert:
+
+        that:
+
+          - item.conn_status | lower == 'up'
+
+          - item.conf_status | lower == 'insync'
+
+        fail_msg: >-
+
+          FortiManager state verification FAILED.
+
+          Device={{ item.hostname }}
+
+          Connection={{ item.conn_status }}
+
+          Configuration={{ item.conf_status }}
+
+          Database={{ item.db_status }}
+
+        success_msg: >-
+
+          FortiManager state is healthy for
+          '{{ item.hostname }}'.
+
+          Connection={{ item.conn_status }}
+
+          Configuration={{ item.conf_status }}
+
+      loop: "{{ device_verification_results }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 15. GET POLICY PACKAGES
+    # ========================================================
+
+    - name: Get policy packages from ADOM
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 3
+
+          method: "get"
+
+          params:
+
+            - url: "/pm/pkg/adom/{{ adom }}"
+
+          session: "{{ fmg_session }}"
+
+          verbose: 1
+
+        return_content: true
+
+      register: policy_packages_response
+
+      failed_when:
+
+        - policy_packages_response.status != 200
+
+        - >
+          policy_packages_response.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+
+    # ========================================================
+    # 16. SAVE POLICY PACKAGES
+    # ========================================================
+
+    - name: Save policy packages
+      ansible.builtin.set_fact:
+
+        policy_packages: >-
+          {{
+            policy_packages_response.json.result[0].data
+            | default([])
+          }}
+
+
+    # ========================================================
+    # 17. INITIALIZE PACKAGE VERIFICATION
+    # ========================================================
+
+    - name: Initialize package verification results
+      ansible.builtin.set_fact:
+
+        package_verification_results: []
+
+
+    # ========================================================
+    # 18. VERIFY POLICY PACKAGE
+    # ========================================================
+
+    - name: Verify policy package
+      ansible.builtin.set_fact:
+
+        package_verification_results: >-
+          {{
+            package_verification_results +
+            [
+              {
+                'hostname': item.hostname,
+                'serial': item.serial,
+                'policy_package': item.policy_package,
+                'vdom': item.vdom,
+                'package_found': package_found,
+                'scope_found': scope_found
+              }
+            ]
+          }}
+
+      vars:
+
+        package_found: >-
+          {%- set ns = namespace(found=false) -%}
+
+          {%- for package in policy_packages -%}
+
+            {%- if package.name == item.policy_package -%}
+
+              {%- set ns.found = true -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.found }}
+
+
+        scope_found: >-
+          {%- set ns = namespace(found=false) -%}
+
+          {%- for package in policy_packages -%}
+
+            {%- if package.name == item.policy_package -%}
+
+              {%- for scope in package['scope member'] | default([]) -%}
+
+                {%- if scope.name == item.hostname
+                      and scope.vdom == item.vdom -%}
+
+                  {%- set ns.found = true -%}
+
+                {%- endif -%}
+
+              {%- endfor -%}
+
+            {%- endif -%}
+
+          {%- endfor -%}
+
+          {{ ns.found }}
+
+      loop: "{{ verification_targets }}"
+
+      loop_control:
+
+        label: "{{ item.policy_package }}"
+
+
+    # ========================================================
+    # 19. DISPLAY PACKAGE VERIFICATION
+    # ========================================================
+
+    - name: Display policy package verification
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=============================================="
+
+          - "POLICY PACKAGE VERIFICATION"
+
+          - "=============================================="
+
+          - "FortiGate       : {{ item.hostname }}"
+
+          - "Serial          : {{ item.serial }}"
+
+          - "Policy package  : {{ item.policy_package }}"
+
+          - "VDOM            : {{ item.vdom }}"
+
+          - "Package found   : {{ item.package_found }}"
+
+          - "Scope found     : {{ item.scope_found }}"
+
+          - "=============================================="
+
+      loop: "{{ package_verification_results }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 20. ASSERT POLICY PACKAGE
+    # ========================================================
+
+    - name: Assert policy package verification
+      ansible.builtin.assert:
+
+        that:
+
+          - item.package_found | bool
+
+          - item.scope_found | bool
+
+        fail_msg: >-
+
+          Policy package verification FAILED.
+
+          FortiGate={{ item.hostname }}
+
+          Package={{ item.policy_package }}
+
+          VDOM={{ item.vdom }}
+
+          Package found={{ item.package_found }}
+
+          Scope found={{ item.scope_found }}
+
+        success_msg: >-
+
+          Policy package '{{ item.policy_package }}'
+          is correctly assigned to
+          '{{ item.hostname }}/{{ item.vdom }}'.
+
+      loop: "{{ package_verification_results }}"
+
+      loop_control:
+
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 21. FINAL VERIFICATION SUMMARY
+    # ========================================================
+
+    - name: Display Step 7 final summary
+      ansible.builtin.debug:
+
+        msg:
+
+          - ""
+
+          - "============================================================"
+
+          - "STEP 7 - INSTALLATION VERIFICATION"
+
+          - "============================================================"
+
+          - "FortiManager : {{ fortimanager_host }}"
+
+          - "ADOM         : {{ adom }}"
+
+          - ""
+
+          - "Device verification       : PASSED"
+
+          - "Serial verification       : PASSED"
+
+          - "VDOM verification         : PASSED"
+
+          - "Connection verification   : PASSED"
+
+          - "Configuration sync        : PASSED"
+
+          - "Policy package            : PASSED"
+
+          - "Package scope             : PASSED"
+
+          - ""
+
+          - "============================================================"
+
+          - "STEP 7 STATUS: SUCCESS"
+
+          - "============================================================"
+
+
+    # ========================================================
+    # 22. LOGOUT
+    # ========================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 99
+
+          method: "exec"
+
+          session: "{{ fmg_session }}"
+
+          params:
+
+            - url: "/sys/logout"
+
+        return_content: true
+
+      when:
+
+        - fmg_session is defined
+
+      failed_when: false
+
+      no_log: true

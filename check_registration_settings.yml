@@ -1,0 +1,76 @@
+---
+- name: Check FortiManager automatic registration settings
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  tasks:
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Get system admin settings
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/cli/global/system/admin/setting"
+        validate_certs: false
+        return_content: true
+      register: registration_settings
+
+    - name: Display registration settings
+      ansible.builtin.debug:
+        msg:
+          allow_register: >-
+            {{
+              registration_settings.json.result[0].data.allow_register
+              | default('NOT RETURNED')
+            }}
+          unreg_dev_opt: >-
+            {{
+              registration_settings.json.result[0].data.unreg_dev_opt
+              | default('NOT RETURNED')
+            }}
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+      no_log: true

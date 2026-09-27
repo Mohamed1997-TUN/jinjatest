@@ -1,0 +1,82 @@
+---
+- name: Discover unauthorized FortiGates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  tasks:
+
+    # ============================================================
+    # 1. Authenticate
+    # ============================================================
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    # ============================================================
+    # 2. Save session
+    # ============================================================
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # 3. Discover unauthorized devices
+    # ============================================================
+    - name: Get unauthorized devices
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device/unreg"
+        validate_certs: false
+        return_content: true
+      register: unauthorized_response
+      no_log: true
+
+    # ============================================================
+    # 4. Display API response
+    # ============================================================
+    - name: Display unauthorized device response
+      ansible.builtin.debug:
+        var: unauthorized_response.json
+
+    # ============================================================
+    # 5. Logout
+    # ============================================================
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+      no_log: true

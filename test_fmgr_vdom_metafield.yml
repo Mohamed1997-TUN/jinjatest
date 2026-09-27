@@ -1,0 +1,227 @@
+---
+# Create a Device VDOM meta field on FortiManager (if missing), then set its
+# value on every device/VDOM listed in vdom_meta_assignments, then read back.
+#
+# UNTESTED against FortiManager 7.0.11. The one unconfirmed piece is
+# meta_field_def_url (see the comment in vars). The playbook stops with a clear
+# message if that URL is not valid on your FortiManager.
+#
+# Run:  export FMG_PASSWORD='...'
+#       ansible-playbook -i inventories/fortimanager_test.ini fmgr_vdom_metafield.yml -v
+
+- name: Automate FortiManager Device VDOM meta field
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  module_defaults:
+    ansible.builtin.uri:
+      url: "https://{{ fortimanager_host }}/jsonrpc"
+      method: POST
+      validate_certs: false
+      body_format: json
+
+  vars:
+    fortimanager_host: "192.168.101.5"
+    fortimanager_user: "admin"
+    fortimanager_password: "{{ lookup('ansible.builtin.env', 'admin') }}"
+
+    target_adom: "root"
+
+    # Where the Device VDOM meta field DEFINITION lives. This is a GUESS by
+    # analogy with /dvmdb/_meta_fields/device. Confirm it by creating the field
+    # once in the GUI with the browser dev tools Network tab open, then paste
+    # the real url here.
+    meta_field_def_url: "/dvmdb/_meta_fields/vdom"
+
+    meta_field_name: "fgt_route_destination"
+    meta_field_importance: "optional"   # optional | required
+    meta_field_length: 20
+
+    # 'set' matches the documented device-level example. If it misbehaves on
+    # VDOMs, switch to 'update'.
+    metafield_set_method: "set"
+
+    vdom_meta_assignments:
+      - device: "dhia-staline-automation"
+        vdom: "root"
+        value: "10.10.70.0"
+      # - device: "another-fgt"
+      #   vdom: "root"
+      #   value: "10.10.80.0"
+
+  tasks:
+
+    # ---------------------------------------------------------------
+    # 1. Login
+    # ---------------------------------------------------------------
+    - name: Make sure a password was provided
+      ansible.builtin.assert:
+        that:
+          - fortimanager_password | length > 0
+        fail_msg: >-
+          The FortiManager password is empty. Run export FMG_PASSWORD='...'
+          in the same shell before ansible-playbook, or pass -e fortimanager_password=...
+        quiet: true
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+      register: fmg_login
+      no_log: true
+
+    - name: Verify FortiManager login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json.session is defined
+        fail_msg: "FortiManager authentication failed: {{ fmg_login.json | to_json }}"
+        quiet: true
+
+    - name: Meta field workflow
+      block:
+
+        # -------------------------------------------------------------
+        # 2. Is the definition already there?
+        # -------------------------------------------------------------
+        - name: Read existing meta field definitions
+          ansible.builtin.uri:
+            body:
+              id: 2
+              method: "get"
+              session: "{{ fmg_login.json.session }}"
+              params:
+                - url: "{{ meta_field_def_url }}"
+          register: metafield_defs
+
+        - name: Stop if the definition URL is not valid on this FortiManager
+          ansible.builtin.assert:
+            that:
+              - metafield_defs.json.result[0].status.code == 0
+            fail_msg: >-
+              {{ meta_field_def_url }} was rejected:
+              {{ metafield_defs.json.result[0].status | to_nice_json }}
+              Capture the real URL from the GUI (create the meta field once with
+              the browser dev tools Network tab open) and update meta_field_def_url.
+            quiet: true
+
+        - name: Work out whether the meta field is already defined
+          ansible.builtin.set_fact:
+            metafield_exists: >-
+              {{ meta_field_name in
+                 (metafield_defs.json.result[0].data | default([])
+                  | map(attribute='name') | list) }}
+
+        # -------------------------------------------------------------
+        # 3. Create the definition when missing
+        # -------------------------------------------------------------
+        - name: Create meta field definition
+          ansible.builtin.uri:
+            body:
+              id: 3
+              method: "add"
+              session: "{{ fmg_login.json.session }}"
+              params:
+                - url: "{{ meta_field_def_url }}"
+                  data:
+                    name: "{{ meta_field_name }}"
+                    importance: "{{ meta_field_importance }}"
+                    length: "{{ meta_field_length | int }}"
+                    status: "enable"
+          register: metafield_create
+          when: not metafield_exists | bool
+          changed_when: true
+
+        - name: Verify definition was created
+          ansible.builtin.assert:
+            that:
+              - metafield_create.json.result[0].status.code == 0
+            fail_msg: >-
+              FortiManager rejected the definition:
+              {{ metafield_create.json | to_nice_json }}
+            quiet: true
+          when: not metafield_exists | bool
+
+        # -------------------------------------------------------------
+        # 4. Set the value on every device/VDOM
+        # -------------------------------------------------------------
+        - name: Set Device VDOM meta field values
+          ansible.builtin.uri:
+            body:
+              id: 4
+              method: "{{ metafield_set_method }}"
+              session: "{{ fmg_login.json.session }}"
+              verbose: 1
+              params:
+                - url: "/dvmdb/adom/{{ target_adom }}/device/{{ item.device }}/vdom/{{ item.vdom }}"
+                  data:
+                    "meta fields":
+                      "{{ meta_field_name }}": "{{ item.value }}"
+          register: metafield_set
+          changed_when: true
+          loop: "{{ vdom_meta_assignments }}"
+          loop_control:
+            label: "{{ item.device }}/{{ item.vdom }}"
+
+        - name: Verify every assignment succeeded
+          ansible.builtin.assert:
+            that:
+              - item.json.result[0].status.code == 0
+            fail_msg: >-
+              {{ item.item.device }}/{{ item.item.vdom }} rejected:
+              {{ item.json | to_nice_json }}
+            quiet: true
+          loop: "{{ metafield_set.results }}"
+          loop_control:
+            label: "{{ item.item.device }}/{{ item.item.vdom }}"
+
+        # -------------------------------------------------------------
+        # 5. Read back
+        # -------------------------------------------------------------
+        - name: Read back VDOM meta fields
+          ansible.builtin.uri:
+            body:
+              id: 5
+              method: "get"
+              session: "{{ fmg_login.json.session }}"
+              verbose: 1
+              params:
+                - url: "/dvmdb/adom/{{ target_adom }}/device/{{ item.device }}/vdom/{{ item.vdom }}"
+                  fields:
+                    - name
+                    - meta fields
+                  option:
+                    - "get meta"
+          register: metafield_read
+          changed_when: false
+          loop: "{{ vdom_meta_assignments }}"
+          loop_control:
+            label: "{{ item.device }}/{{ item.vdom }}"
+
+        - name: Show read-back
+          ansible.builtin.debug:
+            msg: "{{ item.json.result[0].data | default({}) }}"
+          loop: "{{ metafield_read.results }}"
+          loop_control:
+            label: "{{ item.item.device }}/{{ item.item.vdom }}"
+
+      # ---------------------------------------------------------------
+      # 6. Always log out
+      # ---------------------------------------------------------------
+      always:
+        - name: Logout from FortiManager
+          ansible.builtin.uri:
+            body:
+              id: 6
+              method: "exec"
+              session: "{{ fmg_login.json.session }}"
+              params:
+                - url: "/sys/logout"
+          when: fmg_login.json.session is defined
+          no_log: true

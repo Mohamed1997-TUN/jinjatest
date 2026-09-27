@@ -1,0 +1,78 @@
+---
+- name: Configure FortiManager Meta Field Assignment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    target_adom: "root"
+
+  tasks:
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+      when: login_response.json.session is defined
+
+    - name: Execute FortiManager Meta Field Operations
+      block:
+        - name: Assign meta field value to Device VDOM via JSON-RPC
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            body_format: json
+            body:
+              id: 2
+              method: "update"
+              session: "{{ fortimanager_session }}"
+              verbose: 1
+              params:
+                - url: "/dvmdb/adom/{{ target_adom }}/device/dhia-staline-automation/vdom/root"
+                  data:
+                    name: "root"
+                    meta fields:
+                      fgt_route_destination: "10.10.60.0"
+            validate_certs: false
+            return_content: true
+          register: meta_assign_response
+
+        - name: Display assignment response
+          ansible.builtin.debug:
+            var: meta_assign_response.json
+
+      always:
+        - name: Logout from FortiManager
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            body_format: json
+            body:
+              id: 3
+              method: "exec"
+              session: "{{ fortimanager_session }}"
+              params:
+                - url: "/sys/logout"
+            validate_certs: false
+            return_content: true
+          when: fortimanager_session is defined

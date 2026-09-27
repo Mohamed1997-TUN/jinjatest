@@ -1,0 +1,417 @@
+---
+- name: Assign FortiGate to existing FortiManager policy package
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+    - vars/firewalls.vars
+
+  vars:
+    target_adom: "root"
+    target_package: "dhia-staline"
+
+    # FortiGate we want to assign
+    target_serial: "FGVMEVP1_E5VM0ED"
+
+    # Safety switch
+    # false = only show what would happen
+    # true  = actually assign the device
+    perform_change: false
+
+  tasks:
+
+    # ============================================================
+    # 1. AUTHENTICATE
+    # ============================================================
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Confirm authentication
+      ansible.builtin.debug:
+        msg: "FortiManager authentication successful."
+
+
+    # ============================================================
+    # 2. GET MANAGED DEVICES
+    # ============================================================
+
+    - name: Get FortiManager devices
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device"
+              fields:
+                - "name"
+                - "sn"
+                - "ip"
+                - "mgmt_mode"
+                - "oid"
+        validate_certs: false
+        return_content: true
+      register: devices_response
+      no_log: true
+
+    - name: Extract devices
+      ansible.builtin.set_fact:
+        fmg_devices: >-
+          {{
+            devices_response.json.result[0].data
+            | default([])
+          }}
+
+
+    # ============================================================
+    # 3. FIND TARGET FORTIGATE BY SERIAL
+    # ============================================================
+
+    - name: Find target FortiGate
+      ansible.builtin.set_fact:
+        target_device: >-
+          {{
+            fmg_devices
+            | selectattr('sn', 'equalto', target_serial)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Verify target FortiGate exists
+      ansible.builtin.fail:
+        msg: >-
+          FortiGate with serial '{{ target_serial }}'
+          was not found in FortiManager.
+      when: target_device | length == 0
+
+    - name: Display target FortiGate
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "TARGET FORTIGATE"
+          - "=============================================="
+          - "Serial: {{ target_device.sn }}"
+          - "Name: {{ target_device.name }}"
+          - "IP: {{ target_device.ip | default('N/A') }}"
+          - "Management mode: {{ target_device.mgmt_mode }}"
+          - "OID: {{ target_device.oid }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 4. VERIFY DEVICE IS MANAGED
+    # ============================================================
+
+    - name: Verify FortiGate is authorized/managed
+      ansible.builtin.fail:
+        msg: >-
+          FortiGate '{{ target_device.name }}' is not currently managed
+          by FortiManager. Current mgmt_mode={{ target_device.mgmt_mode }}.
+      when: target_device.mgmt_mode | int != 3
+
+
+    # ============================================================
+    # 5. GET POLICY PACKAGE
+    # ============================================================
+
+    - name: Get target policy package
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}/{{ target_package }}"
+        validate_certs: false
+        return_content: true
+      register: package_response
+      no_log: true
+
+    - name: Extract policy package
+      ansible.builtin.set_fact:
+        policy_package: >-
+          {{
+            package_response.json.result[0].data
+            | default({})
+          }}
+
+    - name: Verify policy package exists
+      ansible.builtin.fail:
+        msg: >-
+          Policy package '{{ target_package }}' was not found
+          in ADOM '{{ target_adom }}'.
+      when: policy_package | length == 0
+
+    - name: Display policy package
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "TARGET POLICY PACKAGE"
+          - "=============================================="
+          - "ADOM: {{ target_adom }}"
+          - "Package: {{ policy_package.name }}"
+          - "OID: {{ policy_package.oid }}"
+          - "Type: {{ policy_package.type }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 6. GET CURRENT INSTALLATION TARGETS
+    # ============================================================
+
+    - name: Get current installation targets
+      ansible.builtin.set_fact:
+        current_targets: >-
+          {{
+            policy_package['scope member']
+            | default([])
+          }}
+
+    - name: Display current installation targets
+      ansible.builtin.debug:
+        msg:
+          - "Current installation targets:"
+          - "{{ current_targets }}"
+
+
+    # ============================================================
+    # 7. CHECK WHETHER DEVICE IS ALREADY ASSIGNED
+    # ============================================================
+
+    - name: Check target assignment
+      ansible.builtin.set_fact:
+        target_already_assigned: >-
+          {{
+            current_targets
+            | selectattr('name', 'equalto', target_device.name)
+            | selectattr('vdom', 'equalto', 'root')
+            | list
+            | length > 0
+          }}
+
+    - name: Display assignment status
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "ASSIGNMENT STATUS"
+          - "=============================================="
+          - "FortiGate: {{ target_device.name }}"
+          - "VDOM: root"
+          - "Policy package: {{ target_package }}"
+          - "Already assigned: {{ target_already_assigned }}"
+          - "Change requested: {{ perform_change }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 8. SHOW WHAT WILL HAPPEN
+    # ============================================================
+
+    - name: Display planned change
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "PLANNED CHANGE"
+          - "=============================================="
+          - "ADOM: {{ target_adom }}"
+          - "Policy package: {{ target_package }}"
+          - "FortiGate: {{ target_device.name }}"
+          - "Serial: {{ target_device.sn }}"
+          - "VDOM: root"
+          - "Action: ADD INSTALLATION TARGET"
+          - "=============================================="
+      when:
+        - not target_already_assigned
+
+
+    # ============================================================
+    # 9. ASSIGN DEVICE TO POLICY PACKAGE
+    # ============================================================
+
+    - name: Assign FortiGate to policy package
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "add"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}/{{ target_package }}/scope member"
+              data:
+                - name: "{{ target_device.name }}"
+                  vdom: "root"
+        validate_certs: false
+        return_content: true
+      register: assignment_response
+      no_log: true
+      when:
+        - perform_change | bool
+        - not target_already_assigned
+
+    - name: Verify assignment API response
+      ansible.builtin.assert:
+        that:
+          - assignment_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          FortiManager failed to assign
+          '{{ target_device.name }}' to policy package
+          '{{ target_package }}'.
+      when:
+        - perform_change | bool
+        - not target_already_assigned
+
+
+    # ============================================================
+    # 10. RE-READ POLICY PACKAGE
+    # ============================================================
+
+    - name: Re-read policy package after assignment
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}/{{ target_package }}"
+        validate_certs: false
+        return_content: true
+      register: package_verify_response
+      no_log: true
+      when: perform_change | bool
+
+    - name: Extract verified installation targets
+      ansible.builtin.set_fact:
+        verified_targets: >-
+          {{
+            package_verify_response.json.result[0].data['scope member']
+            | default([])
+          }}
+      when: perform_change | bool
+
+
+    # ============================================================
+    # 11. VERIFY DEVICE IS NOW AN INSTALLATION TARGET
+    # ============================================================
+
+    - name: Verify FortiGate assignment
+      ansible.builtin.set_fact:
+        assignment_verified: >-
+          {{
+            verified_targets
+            | selectattr('name', 'equalto', target_device.name)
+            | selectattr('vdom', 'equalto', 'root')
+            | list
+            | length > 0
+          }}
+      when: perform_change | bool
+
+    - name: Display verification result
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "VERIFICATION"
+          - "=============================================="
+          - "Policy package: {{ target_package }}"
+          - "FortiGate: {{ target_device.name }}"
+          - "VDOM: root"
+          - "Assignment verified: {{ assignment_verified }}"
+          - "=============================================="
+      when: perform_change | bool
+
+    - name: Fail if assignment was not verified
+      ansible.builtin.fail:
+        msg: >-
+          The API request succeeded but FortiManager did not show
+          '{{ target_device.name }}' as an installation target.
+      when:
+        - perform_change | bool
+        - not assignment_verified
+
+
+    # ============================================================
+    # 12. FINAL SUMMARY
+    # ============================================================
+
+    - name: Display final result
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "FORTIMANAGER POLICY PACKAGE ASSIGNMENT"
+          - "================================================"
+          - "ADOM: {{ target_adom }}"
+          - "Policy package: {{ target_package }}"
+          - "FortiGate: {{ target_device.name }}"
+          - "Serial: {{ target_device.sn }}"
+          - "VDOM: root"
+          - >-
+            Result:
+            {{
+              'ALREADY ASSIGNED'
+              if target_already_assigned
+              else
+              ('ASSIGNMENT SUCCESSFUL' if perform_change | bool
+              else 'DRY RUN - NO CHANGE')
+            }}
+          - "================================================"
+
+
+    # ============================================================
+    # 13. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 6
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+        return_content: true
+      register: logout_response
+      no_log: true
+
+    - name: Confirm logout
+      ansible.builtin.debug:
+        msg: "FortiManager session closed."

@@ -1,0 +1,355 @@
+---
+- name: Step 00 - FortiGate Central Management via REST API
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/secrets.yml
+    - vars/fortimanager.vars
+    - vars/firewalls.vars
+
+  tasks:
+
+    # =========================================================
+    # 1. CHECK FORTIMANAGER VARIABLES
+    # =========================================================
+
+    - name: Check FortiManager variables
+      ansible.builtin.assert:
+        that:
+          - fortimanager_host is defined
+          - fortimanager_serial is defined
+        fail_msg: "FortiManager variables are missing."
+
+
+    # =========================================================
+    # 2. CHECK FORTIGATE API TOKENS
+    # =========================================================
+
+    - name: Check each FortiGate API token
+      ansible.builtin.assert:
+        that:
+          - item.api_token is defined
+          - item.api_token | length > 0
+        fail_msg: "API token is missing for {{ item.hostname }}"
+      loop: "{{ firewalls }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+      no_log: true
+
+
+    # =========================================================
+    # 3. GET CURRENT CENTRAL MANAGEMENT CONFIGURATION
+    # =========================================================
+
+    - name: Get current FortiGate Central Management configuration
+      ansible.builtin.uri:
+        url: >-
+          http://{{ item.management_ip }}/api/v2/cmdb/system/central-management?vdom=root
+        method: GET
+        headers:
+          Authorization: "Bearer {{ item.api_token }}"
+          Accept: "application/json"
+        validate_certs: false
+        return_content: true
+        status_code:
+          - 200
+          - 401
+          - 403
+          - 404
+          - 500
+
+      loop: "{{ firewalls }}"
+
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.management_ip }})"
+
+      register: central_management_get
+
+      changed_when: false
+
+      failed_when: false
+
+      no_log: true
+
+
+    # =========================================================
+    # 4. INITIALIZE CURRENT RESULTS
+    # =========================================================
+
+    - name: Initialize current Central Management results
+      ansible.builtin.set_fact:
+        central_management_current: []
+
+
+    # =========================================================
+    # 5. PARSE REACHABLE RESPONSES
+    # =========================================================
+    #
+    # We use item.json instead of:
+    #
+    #     item.stdout | from_json
+    #
+    # This avoids the previous parsing failure.
+    #
+    # =========================================================
+
+    - name: Parse reachable FortiGate responses
+      ansible.builtin.set_fact:
+        central_management_current: >-
+          {{
+            central_management_current +
+            [
+              {
+                'firewall': item.item,
+                'response': item.json | default({}),
+                'status_code': item.status | default(0),
+                'content': item.content | default('')
+              }
+            ]
+          }}
+
+      loop: "{{ central_management_get.results }}"
+
+      loop_control:
+        label: "{{ item.item.hostname }}"
+
+      when:
+        - item.status | default(0) | int == 200
+        - item.json is defined
+
+      no_log: true
+
+
+    # =========================================================
+    # 6. DISPLAY CONNECTIVITY / API PROBLEMS
+    # =========================================================
+
+    - name: Display FortiGate API problems
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate: {{ item.item.hostname }}"
+          - "Management IP: {{ item.item.management_ip }}"
+          - "HTTP status: {{ item.status | default('N/A') }}"
+          - "Error: FortiGate Central Management API did not return a valid JSON response."
+
+      loop: "{{ central_management_get.results }}"
+
+      loop_control:
+        label: "{{ item.item.hostname }}"
+
+      when:
+        - item.status | default(0) | int != 200
+          or
+          item.json is not defined
+
+
+    # =========================================================
+    # 7. CONFIGURE CENTRAL MANAGEMENT
+    # =========================================================
+
+    - name: Configure FortiGate Central Management
+      ansible.builtin.uri:
+
+        url: >-
+          http://{{ item.firewall.management_ip }}/api/v2/cmdb/system/central-management?vdom=root
+
+        method: PUT
+
+        headers:
+          Authorization: "Bearer {{ item.firewall.api_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+
+        body_format: json
+
+        body:
+          type: "fortimanager"
+          fmg: "{{ fortimanager_host }}"
+          serial-number: "{{ fortimanager_serial }}"
+
+        validate_certs: false
+
+        return_content: true
+
+        status_code:
+          - 200
+          - 201
+
+      loop: "{{ central_management_current }}"
+
+      loop_control:
+        label: "{{ item.firewall.hostname }} ({{ item.firewall.management_ip }})"
+
+      register: central_management_config
+
+      changed_when: true
+
+      failed_when: false
+
+      when:
+        - item.response.status | default('') == 'success'
+        - >
+          item.response.results.type | default('none') != 'fortimanager'
+          or
+          item.response.results.fmg | default('') != '"' ~ fortimanager_host ~ '"'
+          or
+          item.response.results['serial-number'] | default('') != '"' ~ fortimanager_serial ~ '"'
+
+      no_log: true
+
+
+    # =========================================================
+    # 8. VERIFY CENTRAL MANAGEMENT
+    # =========================================================
+
+    - name: Verify FortiGate Central Management configuration
+      ansible.builtin.uri:
+
+        url: >-
+          http://{{ item.api_token | ternary(item.management_ip, item.management_ip) }}/api/v2/cmdb/system/central-management?vdom=root
+
+        method: GET
+
+        headers:
+          Authorization: "Bearer {{ item.api_token }}"
+          Accept: "application/json"
+
+        validate_certs: false
+
+        return_content: true
+
+        status_code:
+          - 200
+          - 401
+          - 403
+          - 404
+          - 500
+
+      loop: "{{ firewalls }}"
+
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.management_ip }})"
+
+      register: central_management_verify
+
+      changed_when: false
+
+      failed_when: false
+
+      no_log: true
+
+
+    # =========================================================
+    # 9. INITIALIZE VERIFIED RESULTS
+    # =========================================================
+
+    - name: Initialize verified Central Management results
+      ansible.builtin.set_fact:
+        central_management_verified: []
+
+
+    # =========================================================
+    # 10. PARSE VERIFICATION RESULTS
+    # =========================================================
+
+    - name: Parse verification responses
+      ansible.builtin.set_fact:
+        central_management_verified: >-
+          {{
+            central_management_verified +
+            [
+              {
+                'firewall': item.item,
+                'response': item.json | default({}),
+                'status_code': item.status | default(0)
+              }
+            ]
+          }}
+
+      loop: "{{ central_management_verify.results }}"
+
+      loop_control:
+        label: "{{ item.item.hostname }}"
+
+      when:
+        - item.status | default(0) | int == 200
+        - item.json is defined
+
+      no_log: true
+
+
+    # =========================================================
+    # 11. DISPLAY FINAL RESULT
+    # =========================================================
+
+    - name: Display Step 00 result
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=============================================="
+
+          - "STEP 00 - CENTRAL MANAGEMENT RESULT"
+
+          - "=============================================="
+
+          - "FortiGate: {{ item.firewall.hostname }}"
+
+          - "Serial: {{ item.firewall.serial }}"
+
+          - "Management IP: {{ item.firewall.management_ip }}"
+
+          - >-
+            {{
+              'CONFIGURED'
+              if (
+                item.status_code == 200
+                and
+                item.response.status | default('') == 'success'
+                and
+                item.response.results.type | default('none') == 'fortimanager'
+                and
+                item.response.results.fmg | default('') == '"' ~ fortimanager_host ~ '"'
+                and
+                item.response.results['serial-number'] | default('') == '"' ~ fortimanager_serial ~ '"'
+              )
+              else
+              'CONFIGURATION MISSING OR INCORRECT'
+            }}
+
+          - "=============================================="
+
+      loop: "{{ central_management_verified }}"
+
+      loop_control:
+        label: "{{ item.firewall.hostname }}"
+
+
+    # =========================================================
+    # 12. FINAL ASSERTION
+    # =========================================================
+
+    - name: Verify all reachable FortiGates are correctly configured
+      ansible.builtin.assert:
+
+        that:
+          - item.status_code == 200
+          - item.response.status | default('') == 'success'
+          - item.response.results.type | default('none') == 'fortimanager'
+          - item.response.results.fmg | default('') == '"' ~ fortimanager_host ~ '"'
+          - item.response.results['serial-number'] | default('') == '"' ~ fortimanager_serial ~ '"'
+
+        fail_msg: >-
+          Central Management verification failed for
+          {{ item.firewall.hostname }}
+          ({{ item.firewall.management_ip }}).
+
+        success_msg: >-
+          Central Management is correctly configured for
+          {{ item.firewall.hostname }}.
+
+      loop: "{{ central_management_verified }}"
+
+      loop_control:
+        label: "{{ item.firewall.hostname }}"

@@ -1,0 +1,171 @@
+---
+- name: Enable automatic FortiGate registration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    # ============================================================
+    # SAFETY SWITCH
+    #
+    # false = check only
+    # true  = enable automatic registration
+    # ============================================================
+    perform_change: false
+
+  tasks:
+
+    # ============================================================
+    # 1. Authenticate
+    # ============================================================
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    # ============================================================
+    # 2. Save session
+    # ============================================================
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    # ============================================================
+    # 3. Read current registration settings
+    # ============================================================
+    - name: Get registration settings
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/cli/global/system/admin/setting"
+        validate_certs: false
+        return_content: true
+      register: registration_settings
+      no_log: true
+
+    # ============================================================
+    # 4. Display current state
+    # ============================================================
+    - name: Display current registration settings
+      ansible.builtin.debug:
+        msg:
+          allow_register: >-
+            {{
+              registration_settings.json.result[0].data.allow_register
+              | default('NOT RETURNED')
+            }}
+          unreg_dev_opt: >-
+            {{
+              registration_settings.json.result[0].data.unreg_dev_opt
+              | default('NOT RETURNED')
+            }}
+
+    # ============================================================
+    # 5. Enable automatic registration
+    #
+    # IMPORTANT:
+    # We only change allow_register.
+    # unreg_dev_opt remains untouched.
+    # ============================================================
+    - name: Enable automatic device registration
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "set"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/cli/global/system/admin/setting"
+              data:
+                allow_register: 1
+        validate_certs: false
+        return_content: true
+      register: registration_change
+      no_log: true
+      when:
+        - perform_change | bool
+        - registration_settings.json.result[0].data.allow_register | int == 0
+
+    # ============================================================
+    # 6. Read settings again
+    # ============================================================
+    - name: Verify registration settings
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/cli/global/system/admin/setting"
+        validate_certs: false
+        return_content: true
+      register: verification_response
+      no_log: true
+      when: perform_change | bool
+
+    # ============================================================
+    # 7. Display verification
+    # ============================================================
+    - name: Display automatic registration status
+      ansible.builtin.debug:
+        msg:
+          allow_register: >-
+            {{
+              verification_response.json.result[0].data.allow_register
+            }}
+          unreg_dev_opt: >-
+            {{
+              verification_response.json.result[0].data.unreg_dev_opt
+            }}
+          status: >-
+            {{
+              'SUCCESS'
+              if verification_response.json.result[0].data.allow_register | int == 1
+              else 'FAILED'
+            }}
+      when: perform_change | bool
+
+    # ============================================================
+    # 8. Logout
+    # ============================================================
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+      no_log: true

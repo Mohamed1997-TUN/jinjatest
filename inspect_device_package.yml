@@ -1,0 +1,147 @@
+---
+- name: Inspect FortiGate policy package assignment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    target_adom: "root"
+    target_device: "dhia-staline-automation"
+    target_vdom: "root"
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN
+    # ============================================================
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+
+    # ============================================================
+    # 2. GET DEVICE OBJECT
+    # ============================================================
+
+    - name: Get target device
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/dvmdb/device/{{ target_device }}"
+        validate_certs: false
+        return_content: true
+      register: device_response
+      no_log: true
+
+    - name: Display device information
+      ansible.builtin.debug:
+        var: device_response.json
+
+
+    # ============================================================
+    # 3. GET PACKAGE STATUS
+    # ============================================================
+
+    - name: Get package status
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: >-
+                /pm/config/adom/{{ target_adom }}/_package/status/{{
+                target_device }}/{{ target_vdom }}
+        validate_certs: false
+        return_content: true
+      register: package_status_response
+      no_log: true
+
+    - name: Display package status
+      ansible.builtin.debug:
+        var: package_status_response.json
+
+
+    # ============================================================
+    # 4. GET ALL PACKAGES
+    # ============================================================
+
+    - name: Get policy packages
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}"
+        validate_certs: false
+        return_content: true
+      register: packages_response
+      no_log: true
+
+    - name: Display policy packages
+      ansible.builtin.debug:
+        var: packages_response.json
+
+
+    # ============================================================
+    # 5. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+        return_content: true
+      register: logout_response
+      no_log: true
+
+    - name: Confirm logout
+      ansible.builtin.debug:
+        msg: "FortiManager session closed."

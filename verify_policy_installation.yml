@@ -1,0 +1,376 @@
+---
+- name: Verify FortiManager policy package installation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    target_adom: "root"
+    target_package: "dhia-staline"
+    target_device: "dhia-staline-automation"
+    target_vdom: "root"
+
+  tasks:
+
+    # ============================================================
+    # 1. LOGIN
+    # ============================================================
+
+    - name: Authenticate to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 1
+          method: "exec"
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+        validate_certs: false
+        return_content: true
+      register: login_response
+      no_log: true
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fortimanager_session: "{{ login_response.json.session }}"
+      no_log: true
+
+    - name: Confirm authentication
+      ansible.builtin.debug:
+        msg: "FortiManager authentication successful."
+
+
+    # ============================================================
+    # 2. VERIFY TARGET FORTIGATE
+    # ============================================================
+
+    - name: Get target FortiGate
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 2
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/dvmdb/device/{{ target_device }}"
+        validate_certs: false
+        return_content: true
+      register: device_response
+      no_log: true
+
+    - name: Verify FortiGate exists
+      ansible.builtin.assert:
+        that:
+          - device_response.json.result[0].status.code | int == 0
+          - device_response.json.result[0].data.name is defined
+        fail_msg: >-
+          FortiManager could not retrieve FortiGate
+          '{{ target_device }}'.
+
+    - name: Extract target device
+      ansible.builtin.set_fact:
+        target_device_data: "{{ device_response.json.result[0].data }}"
+
+    - name: Display target FortiGate
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "TARGET FORTIGATE"
+          - "=============================================="
+          - "Name: {{ target_device_data.name }}"
+          - "Serial: {{ target_device_data.sn }}"
+          - "IP: {{ target_device_data.ip }}"
+          - "Connection status: {{ target_device_data.conn_status | default('N/A') }}"
+          - "Config status: {{ target_device_data.conf_status | default('N/A') }}"
+          - "VDOM: {{ target_vdom }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 3. VERIFY VDOM
+    # ============================================================
+
+    - name: Verify target VDOM
+      ansible.builtin.set_fact:
+        target_vdom_exists: >-
+          {{
+            target_device_data.vdom
+            | selectattr('name', 'equalto', target_vdom)
+            | list
+            | length > 0
+          }}
+
+    - name: Fail if VDOM does not exist
+      ansible.builtin.fail:
+        msg: >-
+          VDOM '{{ target_vdom }}' was not found on
+          FortiGate '{{ target_device }}'.
+      when: not target_vdom_exists
+
+    - name: Confirm target VDOM
+      ansible.builtin.debug:
+        msg: "VDOM verified: {{ target_vdom }}"
+
+
+    # ============================================================
+    # 4. GET POLICY PACKAGE
+    # ============================================================
+
+    - name: Get policy package list
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 3
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: "/pm/pkg/adom/{{ target_adom }}"
+        validate_certs: false
+        return_content: true
+      register: packages_response
+      no_log: true
+
+    - name: Verify policy package API response
+      ansible.builtin.assert:
+        that:
+          - packages_response.json.result[0].status.code | int == 0
+        fail_msg: "FortiManager could not retrieve policy packages."
+
+    - name: Find target policy package
+      ansible.builtin.set_fact:
+        policy_package: >-
+          {{
+            packages_response.json.result[0].data
+            | selectattr('name', 'equalto', target_package)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Fail if policy package does not exist
+      ansible.builtin.fail:
+        msg: >-
+          Policy package '{{ target_package }}' was not found
+          in ADOM '{{ target_adom }}'.
+      when: policy_package | length == 0
+
+    - name: Display policy package
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "POLICY PACKAGE"
+          - "=============================================="
+          - "ADOM: {{ target_adom }}"
+          - "Package: {{ policy_package.name }}"
+          - "OID: {{ policy_package.oid }}"
+          - "Type: {{ policy_package.type }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 5. VERIFY PACKAGE TARGET
+    # ============================================================
+
+    - name: Extract package scope members
+      ansible.builtin.set_fact:
+        package_targets: >-
+          {{
+            policy_package['scope member']
+            | default([])
+          }}
+
+    - name: Check target membership
+      ansible.builtin.set_fact:
+        target_in_package: >-
+          {{
+            package_targets
+            | selectattr('name', 'equalto', target_device)
+            | selectattr('vdom', 'equalto', target_vdom)
+            | list
+            | length > 0
+          }}
+
+    - name: Verify package target
+      ansible.builtin.assert:
+        that:
+          - target_in_package
+        fail_msg: >-
+          FortiGate '{{ target_device }}' / VDOM '{{ target_vdom }}'
+          is not assigned to policy package '{{ target_package }}'.
+
+    - name: Display package target
+      ansible.builtin.debug:
+        msg:
+          - "Package target verified."
+          - "FortiGate: {{ target_device }}"
+          - "VDOM: {{ target_vdom }}"
+          - "Package: {{ target_package }}"
+
+
+    # ============================================================
+    # 6. CHECK FORTIMANAGER PACKAGE STATUS
+    # ============================================================
+
+    - name: Get policy package status
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 4
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: >-
+                /pm/config/adom/{{ target_adom }}/_package/status/{{
+                target_device }}/{{ target_vdom }}
+        validate_certs: false
+        return_content: true
+      register: package_status_response
+      no_log: true
+
+    - name: Verify package status API response
+      ansible.builtin.assert:
+        that:
+          - package_status_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          FortiManager could not retrieve package installation status.
+
+    - name: Extract package status
+      ansible.builtin.set_fact:
+        package_status: >-
+          {{
+            package_status_response.json.result[0].data
+            | default({})
+          }}
+
+    - name: Display package status
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "FORTIMANAGER PACKAGE STATUS"
+          - "=============================================="
+          - "Device: {{ package_status.dev | default(target_device) }}"
+          - "VDOM: {{ package_status.vdom | default(target_vdom) }}"
+          - "Status: {{ package_status.status | default('N/A') }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 7. GET FIREWALL POLICIES
+    # ============================================================
+
+    - name: Get firewall policies from policy package
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 5
+          method: "get"
+          session: "{{ fortimanager_session }}"
+          verbose: 1
+          params:
+            - url: >-
+                /pm/config/adom/{{ target_adom }}/pkg/{{
+                target_package }}/firewall/policy
+              fields:
+                - "policyid"
+                - "name"
+                - "srcintf"
+                - "dstintf"
+                - "srcaddr"
+                - "dstaddr"
+                - "service"
+                - "action"
+                - "status"
+                - "schedule"
+                - "logtraffic"
+        validate_certs: false
+        return_content: true
+      register: firewall_policies_response
+      no_log: true
+
+    - name: Verify firewall policy API response
+      ansible.builtin.assert:
+        that:
+          - firewall_policies_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          FortiManager could not retrieve firewall policies.
+
+    - name: Extract firewall policies
+      ansible.builtin.set_fact:
+        firewall_policies: >-
+          {{
+            firewall_policies_response.json.result[0].data
+            | default([])
+          }}
+
+    - name: Display firewall policies
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "FIREWALL POLICIES"
+          - "=============================================="
+          - "Policy count: {{ firewall_policies | length }}"
+          - "{{ firewall_policies }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 8. FINAL VERIFICATION REPORT
+    # ============================================================
+
+    - name: Display final verification result
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "STEP 7 - INSTALLATION VERIFICATION"
+          - "================================================"
+          - "FortiGate: {{ target_device }}"
+          - "Serial: {{ target_device_data.sn }}"
+          - "VDOM: {{ target_vdom }}"
+          - "Policy package: {{ target_package }}"
+          - "Package target: VERIFIED"
+          - "Package status: {{ package_status.status | default('N/A') }}"
+          - "Firewall policies: {{ firewall_policies | length }}"
+          - "================================================"
+          - "VERIFICATION COMPLETED"
+          - "================================================"
+
+
+    # ============================================================
+    # 9. LOGOUT
+    # ============================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        body_format: json
+        body:
+          id: 6
+          method: "exec"
+          session: "{{ fortimanager_session }}"
+          params:
+            - url: "/sys/logout"
+        validate_certs: false
+        return_content: true
+      register: logout_response
+      no_log: true
+
+    - name: Confirm logout
+      ansible.builtin.debug:
+        msg: "FortiManager session closed."

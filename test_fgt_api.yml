@@ -1,0 +1,41 @@
+---
+- name: Test FortiGate REST API with curl
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/secrets.yml
+
+  tasks:
+
+    - name: Test FortiGate REST API
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -k
+          - -sS
+          - -X
+          - GET
+          - -H
+          - "Authorization: Bearer {{ vault_milano_api_token }}"
+          - -H
+          - "Accept: application/json"
+          - "https://192.168.101.149/api/v2/cmdb/system/central-management?vdom=root"
+      register: fgt_api_test
+      changed_when: false
+      no_log: true
+
+    - name: Parse FortiGate response
+      ansible.builtin.set_fact:
+        fgt_api_json: "{{ fgt_api_test.stdout | from_json }}"
+
+    - name: Display API result
+      ansible.builtin.debug:
+        msg:
+          - "HTTP status: {{ fgt_api_json.http_status | default('unknown') }}"
+          - "FortiGate status: {{ fgt_api_json.status | default('unknown') }}"
+          - "FortiGate serial: {{ fgt_api_json.serial | default('unknown') }}"
+          - "FortiOS version: {{ fgt_api_json.version | default('unknown') }}"
+          - "Central Management type: {{ fgt_api_json.results.type | default('unknown') }}"
+          - "FortiManager: {{ fgt_api_json.results.fmg | default('unknown') }}"
+          - "FortiManager serial: {{ fgt_api_json.results['serial-number'] | default('unknown') }}"
