@@ -1,18 +1,13 @@
 ---
-- name: Step 00.1 - Configure FortiGate Hostname
+- name: Configure FortiGate hostname from NetBox
   hosts: all
+  connection: local
   gather_facts: false
 
   vars_files:
-    - vars/secrets.yml
-    - vars/firewalls.vars
     - vars/fortigate.vars
 
   vars:
-
-    # ============================================================
-    # SSH parameters
-    # ============================================================
     ssh_port: 22
 
     ssh_options: >-
@@ -21,125 +16,47 @@
       -o UserKnownHostsFile=/dev/null
       -o ConnectTimeout=10
 
-
   tasks:
 
-    # ============================================================
-    # 1. Validate firewall definitions
-    # ============================================================
-    - name: Check FortiGate definitions
-      ansible.builtin.assert:
-        that:
-          - firewalls is defined
-          - firewalls | length > 0
-          - item.serial is defined
-          - item.hostname is defined
-          - item.management_ip is defined
-          - item.serial | length > 0
-          - item.hostname | length > 0
-          - item.management_ip | length > 0
+    - name: Display target FortiGate
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate hostname : {{ inventory_hostname }}"
+          - "Management IP      : {{ ansible_host }}"
+          - "Serial             : {{ asset_tag | default('N/A') }}"
 
-        fail_msg: >-
-          Invalid FortiGate definition for
-          {{ item.serial | default('unknown') }}.
-
-        success_msg: >-
-          FortiGate {{ item.serial }} definition is valid.
-
-      loop: "{{ firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial | default('unknown') }}"
-
-      no_log: true
-
-
-    # ============================================================
-    # 2. Validate SSH credentials
-    # ============================================================
-    - name: Check FortiGate SSH credentials
-      ansible.builtin.assert:
-        that:
-          - fortigate_user is defined
-          - fortigate_password is defined
-          - fortigate_user | length > 0
-          - fortigate_password | length > 0
-
-        fail_msg: "FortiGate SSH credentials are missing."
-
-        success_msg: "FortiGate SSH credentials are correctly defined."
-
-      no_log: true
-
-
-    # ============================================================
-    # 3. Configure hostname through SSH
-    #
-    # IMPORTANT:
-    # We temporarily do NOT fail the task so we can inspect
-    # the SSH session result.
-    # ============================================================
     - name: Configure FortiGate hostname
       ansible.builtin.expect:
-
         command: >-
           ssh {{ ssh_options }}
           -p {{ ssh_port }}
-          {{ fortigate_user }}@{{ item.management_ip }}
+          {{ fortigate_user }}@{{ ansible_host }}
 
         responses:
 
-          # SSH authentication
+          '(?i)are you sure you want to continue connecting':
+            - "yes"
+
           '(?i)password:':
             - "{{ fortigate_password }}"
 
-          # FortiGate CLI prompt
           '[#>$]\s*$':
             - "config system global"
-            - "set hostname {{ item.hostname }}"
+            - "set hostname {{ inventory_hostname }}"
             - "end"
             - "get system status"
             - "exit"
 
         timeout: 30
-
         echo: false
 
-      loop: "{{ firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }} -> {{ item.hostname }}"
-
-      register: hostname_configuration
-
-      failed_when: false
-
+      register: hostname_change
       no_log: true
 
-
-    # ============================================================
-    # 4. Display SSH session result
-    #
-    # Only safe diagnostic fields are displayed.
-    # ============================================================
-    - name: Display SSH session diagnostic
+    - name: Confirm hostname command completed
       ansible.builtin.debug:
         msg:
-          serial: "{{ item.item.serial }}"
-          management_ip: "{{ item.item.management_ip }}"
-          return_code: "{{ item.rc | default('undefined') }}"
-          stdout: "{{ item.stdout | default('') }}"
-          stderr: "{{ item.stderr | default('') }}"
-          message: "{{ item.msg | default('') }}"
-
-      loop: "{{ hostname_configuration.results }}"
-
-      loop_control:
-        label: "{{ item.item.serial }}"
-
-
-    # ============================================================
-    # 5. Stop here for debugging
-    # ============================================================
-    - name: Stop after SSH diagnostic
-      ansible.builtin.meta: end_play
+          - "Hostname configuration completed"
+          - "FortiGate: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host }}"
+          - "Serial: {{ asset_tag | default('N/A') }}"
