@@ -1,5 +1,5 @@
 ---
-- name: Configure FortiGate hostname from NetBox
+- name: Diagnose FortiGate SSH from AWX using NetBox inventory
   hosts: all
   connection: local
   gather_facts: false
@@ -15,17 +15,90 @@
       -o StrictHostKeyChecking=no
       -o UserKnownHostsFile=/dev/null
       -o ConnectTimeout=10
+      -o PreferredAuthentications=password
+      -o PubkeyAuthentication=no
 
   tasks:
 
-    - name: Display target FortiGate
+    # ============================================================
+    # 1. DISPLAY NETBOX INVENTORY INFORMATION
+    # ============================================================
+
+    - name: Display NetBox inventory information
       ansible.builtin.debug:
         msg:
-          - "FortiGate hostname : {{ inventory_hostname }}"
+          - "Inventory hostname : {{ inventory_hostname }}"
           - "Management IP      : {{ ansible_host }}"
           - "Serial             : {{ asset_tag | default('N/A') }}"
 
-    - name: Configure FortiGate hostname
+    # ============================================================
+    # 2. CHECK PEXPECT
+    # ============================================================
+
+    - name: Check Python pexpect library
+      ansible.builtin.command:
+        cmd: python3 -c "import pexpect; print(pexpect.__version__)"
+      register: pexpect_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Display pexpect result
+      ansible.builtin.debug:
+        msg:
+          - "pexpect return code: {{ pexpect_check.rc }}"
+          - "pexpect stdout: {{ pexpect_check.stdout | default('') }}"
+          - "pexpect stderr: {{ pexpect_check.stderr | default('') }}"
+      run_once: true
+
+    # ============================================================
+    # 3. CHECK SSH CLIENT
+    # ============================================================
+
+    - name: Check SSH client
+      ansible.builtin.command:
+        cmd: ssh -V
+      register: ssh_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Display SSH client result
+      ansible.builtin.debug:
+        msg:
+          - "SSH return code: {{ ssh_check.rc }}"
+          - "SSH stdout: {{ ssh_check.stdout | default('') }}"
+          - "SSH stderr: {{ ssh_check.stderr | default('') }}"
+      run_once: true
+
+    # ============================================================
+    # 4. CHECK TCP CONNECTIVITY TO FORTIGATE
+    # ============================================================
+
+    - name: Check TCP connectivity to FortiGate SSH
+      ansible.builtin.command:
+        cmd: >-
+          bash -c
+          'timeout 5 bash -c "</dev/tcp/{{ ansible_host }}/{{ ssh_port }}"'
+      register: tcp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display TCP connectivity result
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate        : {{ inventory_hostname }}"
+          - "Management IP    : {{ ansible_host }}"
+          - "SSH port         : {{ ssh_port }}"
+          - "TCP return code  : {{ tcp_check.rc }}"
+          - "TCP stdout       : {{ tcp_check.stdout | default('') }}"
+          - "TCP stderr       : {{ tcp_check.stderr | default('') }}"
+
+    # ============================================================
+    # 5. TEST SSH LOGIN
+    # ============================================================
+
+    - name: Test SSH login to FortiGate
       ansible.builtin.expect:
         command: >-
           ssh {{ ssh_options }}
@@ -41,22 +114,38 @@
             - "{{ fortigate_password }}"
 
           '[#>$]\s*$':
-            - "config system global"
-            - "set hostname {{ inventory_hostname }}"
-            - "end"
             - "get system status"
             - "exit"
 
         timeout: 30
         echo: false
 
-      register: hostname_change
+      register: ssh_test
+      failed_when: false
       no_log: true
 
-    - name: Confirm hostname command completed
+    # ============================================================
+    # 6. DISPLAY SAFE SSH RESULT
+    # ============================================================
+
+    - name: Display SSH diagnostic result
       ansible.builtin.debug:
         msg:
-          - "Hostname configuration completed"
-          - "FortiGate: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host }}"
-          - "Serial: {{ asset_tag | default('N/A') }}"
+          - "FortiGate     : {{ inventory_hostname }}"
+          - "Management IP : {{ ansible_host }}"
+          - "Return code   : {{ ssh_test.rc | default('N/A') }}"
+          - "Changed       : {{ ssh_test.changed | default(false) }}"
+          - "Failed       : {{ ssh_test.failed | default(false) }}"
+          - "Message      : {{ ssh_test.msg | default('') }}"
+          - "Stdout       : {{ ssh_test.stdout | default('') | regex_replace('(?i)(password|passwd|token|secret)[^\\n]*', '[REDACTED]') }}"
+          - "Stderr       : {{ ssh_test.stderr | default('') | regex_replace('(?i)(password|passwd|token|secret)[^\\n]*', '[REDACTED]') }}"
+
+    # ============================================================
+    # 7. END DIAGNOSTIC RUN
+    # ============================================================
+
+    - name: Diagnostic completed
+      ansible.builtin.debug:
+        msg:
+          - "SSH diagnostic completed for {{ inventory_hostname }}"
+          - "No FortiGate configuration was modified."
