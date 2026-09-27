@@ -1,5 +1,5 @@
 ---
-- name: Configure FortiGate hostname from NetBox inventory
+- name: Diagnose FortiGate hostname SSH session
   hosts: all
   connection: local
   gather_facts: false
@@ -20,22 +20,14 @@
 
   tasks:
 
-    # ============================================================
-    # 1. DISPLAY TARGET
-    # ============================================================
-
-    - name: Display target FortiGate
+    - name: Display target
       ansible.builtin.debug:
         msg:
-          - "FortiGate hostname : {{ inventory_hostname }}"
-          - "Management IP      : {{ ansible_host }}"
-          - "Serial             : {{ asset_tag | default('N/A') }}"
+          - "Hostname: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host }}"
+          - "Serial: {{ asset_tag | default('N/A') }}"
 
-    # ============================================================
-    # 2. CONFIGURE HOSTNAME
-    # ============================================================
-
-    - name: Configure FortiGate hostname
+    - name: Test FortiGate SSH session
       ansible.builtin.expect:
         command: >-
           ssh {{ ssh_options }}
@@ -50,27 +42,23 @@
           '(?i)password:':
             - "{{ fortigate_password }}"
 
-          '[#>$]\s*$':
-            - "config system global"
-            - "set hostname {{ inventory_hostname }}"
-            - "end"
+          '(?i)[#>$]\s*$':
             - "get system status"
             - "exit"
 
         timeout: 30
         echo: false
 
-      register: hostname_change
+      register: ssh_test
+      failed_when: false
       no_log: true
 
-    # ============================================================
-    # 3. CONFIRM
-    # ============================================================
-
-    - name: Confirm hostname configuration
+    - name: Show SSH diagnostic safely
       ansible.builtin.debug:
         msg:
-          - "Hostname configuration completed."
-          - "FortiGate : {{ inventory_hostname }}"
-          - "IP        : {{ ansible_host }}"
-          - "Serial    : {{ asset_tag | default('N/A') }}"
+          - "rc: {{ ssh_test.rc | default('N/A') }}"
+          - "changed: {{ ssh_test.changed | default(false) }}"
+          - "failed: {{ ssh_test.failed | default(false) }}"
+          - "msg: {{ ssh_test.msg | default('') }}"
+          - "stdout: {{ ssh_test.stdout | default('') }}"
+          - "stderr: {{ ssh_test.stderr | default('') }}"
