@@ -1,10 +1,12 @@
 ---
-- name: Configure FortiGate hostname from NetBox inventory
+- name: Configure FortiGate hostname
   hosts: all
   connection: local
   gather_facts: false
 
   vars_files:
+    - vars/secrets.yml
+    - vars/firewalls.vars
     - vars/fortigate.vars
 
   vars:
@@ -20,44 +22,38 @@
 
   tasks:
 
-    - name: Display target FortiGate
+    - name: Find firewall configuration using NetBox serial
+      ansible.builtin.set_fact:
+        selected_firewall: >-
+          {{
+            firewalls
+            | selectattr('serial', 'equalto', asset_tag)
+            | list
+            | first
+          }}
+
+    - name: Validate firewall was found
+      ansible.builtin.assert:
+        that:
+          - selected_firewall is defined
+          - selected_firewall is not none
+        fail_msg: >-
+          No firewall was found in firewalls.vars with serial
+          {{ asset_tag }}
+
+    - name: Display selected firewall
       ansible.builtin.debug:
         msg:
-          - "FortiGate hostname : {{ inventory_hostname }}"
-          - "Management IP      : {{ ansible_host }}"
-          - "Serial             : {{ asset_tag | default('N/A') }}"
+          - "NetBox serial      : {{ asset_tag }}"
+          - "Configured hostname: {{ selected_firewall.hostname }}"
+          - "Management IP      : {{ selected_firewall.management_ip }}"
 
-    - name: Get current FortiGate hostname
+    - name: Configure FortiGate hostname
       ansible.builtin.expect:
         command: >-
           ssh {{ ssh_options }}
           -p {{ ssh_port }}
-          {{ fortigate_user }}@{{ ansible_host }}
-
-        responses:
-
-          '(?i)are you sure you want to continue connecting':
-            - "yes"
-
-          '(?i)password:':
-            - "{{ fortigate_password }}"
-
-          '[#>$]\s*$':
-            - "get system status"
-            - "exit"
-
-        timeout: 30
-        echo: false
-
-      register: current_status
-      no_log: true
-
-    - name: Configure hostname
-      ansible.builtin.expect:
-        command: >-
-          ssh {{ ssh_options }}
-          -p {{ ssh_port }}
-          {{ fortigate_user }}@{{ ansible_host }}
+          {{ fortigate_user }}@{{ selected_firewall.management_ip }}
 
         responses:
 
@@ -69,7 +65,7 @@
 
           '[#>$]\s*$':
             - "config system global"
-            - "set hostname {{ inventory_hostname }}"
+            - "set hostname {{ selected_firewall.hostname }}"
             - "end"
             - "get system status"
             - "exit"
@@ -83,7 +79,7 @@
     - name: Confirm hostname configuration
       ansible.builtin.debug:
         msg:
-          - "Hostname configuration completed."
-          - "FortiGate : {{ inventory_hostname }}"
-          - "IP        : {{ ansible_host }}"
-          - "Serial    : {{ asset_tag | default('N/A') }}"
+          - "Hostname configured successfully."
+          - "Serial    : {{ asset_tag }}"
+          - "Hostname  : {{ selected_firewall.hostname }}"
+          - "Management: {{ selected_firewall.management_ip }}"
