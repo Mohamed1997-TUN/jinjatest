@@ -1,5 +1,5 @@
 ---
-- name: Configure FortiGate hostname
+- name: Debug NetBox serial matching
   hosts: all
   connection: local
   gather_facts: false
@@ -9,77 +9,43 @@
     - vars/firewalls.vars
     - vars/fortigate.vars
 
-  vars:
-    ssh_port: 22
-
-    ssh_options: >-
-      -tt
-      -o StrictHostKeyChecking=no
-      -o UserKnownHostsFile=/dev/null
-      -o ConnectTimeout=10
-      -o PreferredAuthentications=password
-      -o PubkeyAuthentication=no
-
   tasks:
 
-    - name: Find firewall configuration using NetBox serial
+    - name: Display NetBox inventory values
+      ansible.builtin.debug:
+        msg:
+          - "Inventory hostname : {{ inventory_hostname }}"
+          - "ansible_host       : {{ ansible_host | default('UNDEFINED') }}"
+          - "asset_tag          : {{ asset_tag | default('UNDEFINED') }}"
+
+    - name: Display firewalls.vars serials
+      ansible.builtin.debug:
+        msg: "{{ firewalls | map(attribute='serial') | list }}"
+
+    - name: Find matching firewall
       ansible.builtin.set_fact:
         selected_firewall: >-
           {{
             firewalls
-            | selectattr('serial', 'equalto', asset_tag)
+            | selectattr(
+                'serial',
+                'equalto',
+                asset_tag | default('')
+              )
             | list
-            | first
           }}
 
-    - name: Validate firewall was found
+    - name: Display matching result
+      ansible.builtin.debug:
+        msg:
+          - "NetBox asset_tag: {{ asset_tag | default('UNDEFINED') }}"
+          - "Matching entries: {{ selected_firewall }}"
+
+    - name: Validate exactly one firewall was found
       ansible.builtin.assert:
         that:
-          - selected_firewall is defined
-          - selected_firewall is not none
+          - selected_firewall | length == 1
         fail_msg: >-
-          No firewall was found in firewalls.vars with serial
-          {{ asset_tag }}
-
-    - name: Display selected firewall
-      ansible.builtin.debug:
-        msg:
-          - "NetBox serial      : {{ asset_tag }}"
-          - "Configured hostname: {{ selected_firewall.hostname }}"
-          - "Management IP      : {{ selected_firewall.management_ip }}"
-
-    - name: Configure FortiGate hostname
-      ansible.builtin.expect:
-        command: >-
-          ssh {{ ssh_options }}
-          -p {{ ssh_port }}
-          {{ fortigate_user }}@{{ selected_firewall.management_ip }}
-
-        responses:
-
-          '(?i)are you sure you want to continue connecting':
-            - "yes"
-
-          '(?i)password:':
-            - "{{ fortigate_password }}"
-
-          '[#>$]\s*$':
-            - "config system global"
-            - "set hostname {{ selected_firewall.hostname }}"
-            - "end"
-            - "get system status"
-            - "exit"
-
-        timeout: 30
-        echo: false
-
-      register: hostname_change
-      no_log: true
-
-    - name: Confirm hostname configuration
-      ansible.builtin.debug:
-        msg:
-          - "Hostname configured successfully."
-          - "Serial    : {{ asset_tag }}"
-          - "Hostname  : {{ selected_firewall.hostname }}"
-          - "Management: {{ selected_firewall.management_ip }}"
+          No unique firewall match found.
+          NetBox asset_tag={{ asset_tag | default('UNDEFINED') }}.
+          firewalls.vars serials={{ firewalls | map(attribute='serial') | list }}
