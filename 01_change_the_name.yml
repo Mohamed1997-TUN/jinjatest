@@ -23,21 +23,10 @@
   tasks:
 
     # =========================================================
-    # 1. Display information received from NetBox
+    # 1. Get firewall information from firewalls.vars
     # =========================================================
 
-    - name: Display NetBox firewall information
-      ansible.builtin.debug:
-        msg:
-          - "NetBox hostname : {{ inventory_hostname }}"
-          - "NetBox IP       : {{ ansible_host | default('UNDEFINED') }}"
-          - "NetBox serial    : {{ asset_tag | default('UNDEFINED') }}"
-
-    # =========================================================
-    # 2. Find the firewall in firewalls.vars
-    # =========================================================
-
-    - name: Find firewall configuration using NetBox serial
+    - name: Find firewall configuration
       ansible.builtin.set_fact:
         selected_firewall: >-
           {{
@@ -53,7 +42,7 @@
           }}
 
     # =========================================================
-    # 3. Validate that the firewall was found
+    # 2. Validate firewall
     # =========================================================
 
     - name: Validate firewall configuration
@@ -64,44 +53,38 @@
           - selected_firewall.hostname is defined
           - selected_firewall.management_ip is defined
         fail_msg: >-
-          No valid firewall configuration was found in
-          firewalls.vars for NetBox serial
+          No valid firewall configuration found for serial
           {{ asset_tag | default('UNDEFINED') }}
 
     # =========================================================
-    # 4. Display the selected configuration
+    # 3. Display selected configuration
     # =========================================================
 
-    - name: Display selected firewall configuration
+    - name: Display selected firewall
       ansible.builtin.debug:
         msg:
-          - "=========================================="
-          - "Selected FortiGate"
-          - "=========================================="
-          - "NetBox serial       : {{ asset_tag }}"
-          - "firewalls.vars serial: {{ selected_firewall.serial }}"
-          - "SSH management IP   : {{ selected_firewall.management_ip }}"
-          - "New hostname        : {{ selected_firewall.hostname }}"
-          - "=========================================="
+          - "NetBox serial        : {{ asset_tag }}"
+          - "Configured serial    : {{ selected_firewall.serial }}"
+          - "Management IP        : {{ selected_firewall.management_ip }}"
+          - "New hostname         : {{ selected_firewall.hostname }}"
 
     # =========================================================
-    # 5. Test TCP connectivity to SSH port
+    # 4. Verify SSH port
     # =========================================================
 
-    - name: Test SSH port connectivity
+    - name: Verify SSH connectivity
       ansible.builtin.wait_for:
         host: "{{ selected_firewall.management_ip }}"
         port: "{{ ssh_port }}"
-        timeout: 10
         state: started
+        timeout: 10
 
     # =========================================================
-    # 6. Connect to FortiGate and change hostname
+    # 5. Change hostname
     # =========================================================
 
     - name: Change FortiGate hostname
       ansible.builtin.expect:
-
         command: >-
           ssh {{ ssh_options }}
           -p {{ ssh_port }}
@@ -109,58 +92,41 @@
 
         responses:
 
-          # SSH first connection confirmation
+          # First SSH connection
           '(?i)are you sure you want to continue connecting':
             - "yes"
 
-          # FortiGate password prompt
+          # SSH password
           '(?i)password:':
             - "{{ fortigate_password }}"
 
-          # FortiGate CLI prompt
-          '[#>$]\s*$':
+          # Normal FortiGate CLI prompt
+          '(?m)[>#]\s*$':
             - "config system global"
+
+          # Global configuration prompt
+          '(?m)\(global\)\s*[>#]\s*$':
             - "set hostname {{ selected_firewall.hostname }}"
             - "end"
-            - "get system status"
+
+          # Back to normal CLI prompt
+          '(?m)[>#]\s*$':
             - "exit"
 
-        timeout: 30
+        timeout: 20
         echo: false
 
       register: hostname_change
 
     # =========================================================
-    # 7. Display expect result
+    # 6. Show result
     # =========================================================
 
     - name: Display hostname change result
       ansible.builtin.debug:
         msg:
-          - "=========================================="
-          - "SSH / EXPECT RESULT"
-          - "=========================================="
-          - "Return code : {{ hostname_change.rc | default('N/A') }}"
-          - "Changed     : {{ hostname_change.changed | default(false) }}"
-          - "Failed      : {{ hostname_change.failed | default(false) }}"
-          - "Message     : {{ hostname_change.msg | default('N/A') }}"
-          - "Stdout      : {{ hostname_change.stdout | default('N/A') }}"
-          - "Stderr      : {{ hostname_change.stderr | default('N/A') }}"
-          - "=========================================="
-
-    # =========================================================
-    # 8. Confirm successful execution
-    # =========================================================
-
-    - name: Confirm hostname configuration
-      ansible.builtin.assert:
-        that:
-          - hostname_change.failed | default(false) == false
-        fail_msg: >-
-          The SSH/expect operation failed while configuring
-          hostname {{ selected_firewall.hostname }}
-          on {{ selected_firewall.management_ip }}.
-
-        success_msg: >-
-          FortiGate hostname {{ selected_firewall.hostname }}
-          was configured successfully.
+          - "Hostname change completed."
+          - "Serial        : {{ selected_firewall.serial }}"
+          - "Hostname      : {{ selected_firewall.hostname }}"
+          - "Management IP : {{ selected_firewall.management_ip }}"
+          - "Return code   : {{ hostname_change.rc | default('N/A') }}"
