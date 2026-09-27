@@ -1,5 +1,5 @@
 ---
-- name: Diagnose FortiGate hostname SSH session
+- name: Configure FortiGate hostname from NetBox inventory
   hosts: all
   connection: local
   gather_facts: false
@@ -20,14 +20,14 @@
 
   tasks:
 
-    - name: Display target
+    - name: Display target FortiGate
       ansible.builtin.debug:
         msg:
-          - "Hostname: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host }}"
-          - "Serial: {{ asset_tag | default('N/A') }}"
+          - "FortiGate hostname : {{ inventory_hostname }}"
+          - "Management IP      : {{ ansible_host }}"
+          - "Serial             : {{ asset_tag | default('N/A') }}"
 
-    - name: Test FortiGate SSH session
+    - name: Get current FortiGate hostname
       ansible.builtin.expect:
         command: >-
           ssh {{ ssh_options }}
@@ -42,23 +42,48 @@
           '(?i)password:':
             - "{{ fortigate_password }}"
 
-          '(?i)[#>$]\s*$':
+          '[#>$]\s*$':
             - "get system status"
             - "exit"
 
         timeout: 30
         echo: false
 
-      register: ssh_test
-      failed_when: false
+      register: current_status
       no_log: true
 
-    - name: Show SSH diagnostic safely
+    - name: Configure hostname
+      ansible.builtin.expect:
+        command: >-
+          ssh {{ ssh_options }}
+          -p {{ ssh_port }}
+          {{ fortigate_user }}@{{ ansible_host }}
+
+        responses:
+
+          '(?i)are you sure you want to continue connecting':
+            - "yes"
+
+          '(?i)password:':
+            - "{{ fortigate_password }}"
+
+          '[#>$]\s*$':
+            - "config system global"
+            - "set hostname {{ inventory_hostname }}"
+            - "end"
+            - "get system status"
+            - "exit"
+
+        timeout: 30
+        echo: false
+
+      register: hostname_change
+      no_log: true
+
+    - name: Confirm hostname configuration
       ansible.builtin.debug:
         msg:
-          - "rc: {{ ssh_test.rc | default('N/A') }}"
-          - "changed: {{ ssh_test.changed | default(false) }}"
-          - "failed: {{ ssh_test.failed | default(false) }}"
-          - "msg: {{ ssh_test.msg | default('') }}"
-          - "stdout: {{ ssh_test.stdout | default('') }}"
-          - "stderr: {{ ssh_test.stderr | default('') }}"
+          - "Hostname configuration completed."
+          - "FortiGate : {{ inventory_hostname }}"
+          - "IP        : {{ ansible_host }}"
+          - "Serial    : {{ asset_tag | default('N/A') }}"
