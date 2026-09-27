@@ -1,0 +1,13 @@
+---
+- name: Test NetBox Dynamic Inventory
+  hosts: all
+  gather_facts: false
+
+  tasks:
+
+    - name: Display NetBox host information
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ inventory_hostname }}"
+          - "Management IP: {{ ansible_host }}"
+          - "Serial: {{ asset_tag }}"
