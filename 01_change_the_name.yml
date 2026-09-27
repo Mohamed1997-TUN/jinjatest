@@ -1,6 +1,6 @@
 ---
 - name: Step 00.1 - Configure FortiGate Hostname
-  hosts: localhost
+  hosts: all
   gather_facts: false
 
   vars_files:
