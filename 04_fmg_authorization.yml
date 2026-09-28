@@ -28,14 +28,16 @@
     # 1. READ FIREWALL DATABASE
     # ============================================================
     #
-    # We intentionally do NOT load firewalls.vars using vars_files.
+    # Do NOT use:
     #
-    # Reason:
-    # firewalls.vars contains vault_* variables for multiple
-    # FortiGates. Ansible would try to resolve all of them before
-    # we select the NetBox device.
+    #   vars_files:
+    #     - vars/firewalls.vars
     #
-    # Instead, read the YAML file as raw text and parse it.
+    # because the file contains vault_* references for multiple
+    # FortiGates.
+    #
+    # We read and parse it only after the play starts, then select
+    # the firewall using the NetBox asset_tag.
     # ============================================================
 
     - name: Read firewall database
@@ -240,25 +242,19 @@
 
 
     # ============================================================
-    # 10. GET ALL DEVICES FROM FORTIMANAGER DVM DATABASE
+    # 10. GET UNAUTHORIZED FORTIGATES
     # ============================================================
     #
-    # IMPORTANT:
+    # FortiManager exposes unauthorized devices using:
     #
-    # We intentionally DO NOT use:
+    #   mgmt_mode == unreg
     #
-    #   filter:
-    #     - ["mgmt_mode", "==", "unreg"]
+    # We retry until the target serial appears.
     #
-    # at this stage.
-    #
-    # The previous filtered request returned no matching device.
-    #
-    # We therefore first retrieve the complete DVM database and
-    # inspect what FortiManager actually returns.
+    # 12 retries x 5 seconds = up to 60 seconds.
     # ============================================================
 
-    - name: Get all FortiGates from FortiManager DVM database
+    - name: Get unauthorized FortiGates from FortiManager
       ansible.builtin.uri:
 
         url: "https://{{ fortimanager_host }}/jsonrpc"
@@ -273,7 +269,9 @@
         body_format: json
 
         body:
+
           id: 2
+
           method: "get"
 
           session: "{{ fmg_session }}"
@@ -291,57 +289,74 @@
                 - "hostname"
                 - "platform_str"
 
+              filter:
+                - "mgmt_mode"
+                - "=="
+                - "unreg"
+
               loadsub: 0
 
         return_content: true
 
-      register: all_devices
+      register: unauthorized_devices
 
       no_log: false
 
+      retries: 12
+
+      delay: 5
+
+      until:
+        - unauthorized_devices.json.result is defined
+        - unauthorized_devices.json.result | length > 0
+        - unauthorized_devices.json.result[0].status.code | int == 0
+        - >
+          (
+            unauthorized_devices.json.result[0].data
+            | default([])
+            | selectattr('sn', 'defined')
+            | selectattr('sn', 'equalto', device_serial)
+            | list
+            | length
+          ) > 0
+
       when:
         - selected_firewall | length > 0
 
 
     # ============================================================
-    # 11. VERIFY DVM DATABASE RESPONSE
+    # 11. VERIFY UNAUTHORIZED DEVICE QUERY
     # ============================================================
 
-    - name: Verify FortiManager DVM response
+    - name: Verify unauthorized device query
       ansible.builtin.assert:
 
         that:
-          - all_devices.json.result is defined
-          - all_devices.json.result | length > 0
-          - all_devices.json.result[0].status.code | int == 0
+          - unauthorized_devices.json.result is defined
+          - unauthorized_devices.json.result | length > 0
+          - unauthorized_devices.json.result[0].status.code | int == 0
 
         fail_msg: >-
-          FortiManager DVM database query failed.
+          FortiManager unauthorized device query failed.
 
           Response:
-          {{ all_devices.json }}
+          {{ unauthorized_devices.json }}
 
         success_msg: >-
-          FortiManager DVM database queried successfully.
+          FortiManager unauthorized device query succeeded.
 
       when:
         - selected_firewall | length > 0
 
 
     # ============================================================
-    # 12. DISPLAY COMPLETE DVM DATABASE
-    # ============================================================
-    #
-    # This is intentionally enabled.
-    #
-    # We need to see exactly how FortiManager represents the
-    # unauthorized device.
+    # 12. DISPLAY UNAUTHORIZED DEVICES RESPONSE
     # ============================================================
 
-    - name: Display FortiManager DVM database
+    - name: Display unauthorized FortiGates
       ansible.builtin.debug:
 
-        var: all_devices.json
+        var: unauthorized_devices.json
 
       when:
         - selected_firewall | length > 0
@@ -356,7 +371,7 @@
 
         target_device: >-
           {{
-            all_devices.json.result[0].data
+            unauthorized_devices.json.result[0].data
             | default([])
             | selectattr('sn', 'defined')
             | selectattr('sn', 'equalto', device_serial)
@@ -370,18 +385,29 @@
 
 
     # ============================================================
-    # 14. DISPLAY TARGET MATCH
+    # 14. DISPLAY TARGET DEVICE
     # ============================================================
 
-    - name: Display target FortiGate match
+    - name: Display target FortiGate
       ansible.builtin.debug:
 
         msg:
+
           - "=============================================="
-          - "FORTIMANAGER DVM MATCH"
+          - "UNAUTHORIZED FORTIGATE FOUND"
           - "=============================================="
-          - "Requested serial : {{ device_serial }}"
-          - "Target device    : {{ target_device }}"
+
+          - "Requested Serial : {{ device_serial }}"
+          - "Device Name      : {{ target_device.name | default('NOT FOUND') }}"
+          - "Serial           : {{ target_device.sn | default('NOT FOUND') }}"
+          - "IP               : {{ target_device.ip | default('NOT FOUND') }}"
+          - "OID              : {{ target_device.oid | default('NOT FOUND') }}"
+          - "Management Mode  : {{ target_device.mgmt_mode | default('NOT FOUND') }}"
+
+          - "Target ADOM      : {{ target_adom }}"
+          - "Target VDOM      : {{ device_vdom }}"
+          - "Policy Package   : {{ policy_package }}"
+
           - "=============================================="
 
       when:
@@ -400,18 +426,16 @@
 
         fail_msg: >-
           FortiGate {{ device_serial }}
-          was not found in the FortiManager DVM database.
+          was not found in FortiManager Unauthorized Devices.
 
-          Check the task:
+          The API query was retried for up to 60 seconds.
 
-          "Display FortiManager DVM database"
-
-          to determine how FortiManager is representing
-          the unauthorized device.
+          Response:
+          {{ unauthorized_devices.json }}
 
         success_msg: >-
           FortiGate {{ device_serial }}
-          was found in the FortiManager DVM database.
+          was found in FortiManager Unauthorized Devices.
 
       when:
         - selected_firewall | length > 0
@@ -425,6 +449,7 @@
       ansible.builtin.debug:
 
         msg:
+
           - "=============================================="
           - "DISCOVERED FORTIGATE"
           - "=============================================="
@@ -448,20 +473,16 @@
 
 
     # ============================================================
-    # 17. VERIFY DEVICE IS UNREGISTERED
-    # ============================================================
-    #
-    # We don't use this as the discovery mechanism anymore.
-    # We only inspect the value returned by FortiManager.
+    # 17. DISPLAY MANAGEMENT MODE
     # ============================================================
 
     - name: Display FortiGate management mode
       ansible.builtin.debug:
 
         msg:
-          - "FortiGate        : {{ target_device.name }}"
-          - "Serial           : {{ target_device.sn }}"
-          - "Management Mode  : {{ target_device.mgmt_mode | default('undefined') }}"
+          - "FortiGate       : {{ target_device.name }}"
+          - "Serial          : {{ target_device.sn }}"
+          - "Management Mode : {{ target_device.mgmt_mode | default('undefined') }}"
 
       when:
         - selected_firewall | length > 0
@@ -472,18 +493,12 @@
     # ============================================================
     #
     # IMPORTANT:
+    # Use the device NAME returned by FortiManager.
     #
-    # FortiManager expects the device NAME from its DVM database
-    # for promote_unreg.
+    # Do not use device_serial here.
     #
-    # Therefore we use:
-    #
-    #   target_device.name
-    #
-    # and NOT:
-    #
-    #   device_name
-    #
+    # FortiManager's GUI device name is expected by
+    # promote_unreg.
     # ============================================================
 
     - name: Authorize FortiGate into target ADOM
@@ -608,6 +623,11 @@
     # ============================================================
     # 22. WAIT FOR AUTHORIZE TASK
     # ============================================================
+    #
+    # FortiManager authorization is asynchronous.
+    #
+    # 30 retries x 5 seconds = up to 150 seconds.
+    # ============================================================
 
     - name: Wait for FortiManager authorize task
       ansible.builtin.uri:
@@ -715,19 +735,13 @@
 
 
     # ============================================================
-    # 25. WAIT FOR DVM CACHE SYNCHRONIZATION
+    # 25. GET DEVICES FROM TARGET ADOM
     # ============================================================
-
-    - name: Wait for DVM cache synchronization
-      ansible.builtin.pause:
-        seconds: 5
-
-      when:
-        - selected_firewall | length > 0
-
-
-    # ============================================================
-    # 26. GET DEVICES FROM TARGET ADOM
+    #
+    # We retry until the authorized device is actually visible
+    # inside the target ADOM.
+    #
+    # 12 retries x 5 seconds = up to 60 seconds.
     # ============================================================
 
     - name: Get devices from target ADOM
@@ -762,12 +776,30 @@
 
       no_log: true
 
+      retries: 12
+
+      delay: 5
+
+      until:
+        - target_devices.json.result is defined
+        - target_devices.json.result | length > 0
+        - target_devices.json.result[0].status.code | int == 0
+        - >
+          (
+            target_devices.json.result[0].data
+            | default([])
+            | selectattr('sn', 'defined')
+            | selectattr('sn', 'equalto', device_serial)
+            | list
+            | length
+          ) > 0
+
       when:
         - selected_firewall | length > 0
 
 
     # ============================================================
-    # 27. VERIFY TARGET ADOM QUERY
+    # 26. VERIFY TARGET ADOM QUERY
     # ============================================================
 
     - name: Verify target ADOM query
@@ -784,15 +816,19 @@
         fail_msg: >-
           Unable to query target ADOM {{ target_adom }}.
 
+          Response:
+          {{ target_devices.json }}
+
         success_msg: >-
-          Target ADOM {{ target_adom }} queried successfully.
+          Target ADOM {{ target_adom }}
+          queried successfully.
 
       when:
         - selected_firewall | length > 0
 
 
     # ============================================================
-    # 28. FIND FORTIGATE IN TARGET ADOM
+    # 27. FIND FORTIGATE IN TARGET ADOM
     # ============================================================
 
     - name: Find FortiGate in target ADOM
@@ -814,7 +850,7 @@
 
 
     # ============================================================
-    # 29. VERIFY FORTIGATE IS IN TARGET ADOM
+    # 28. VERIFY FORTIGATE IS IN TARGET ADOM
     # ============================================================
 
     - name: Verify FortiGate is in target ADOM
@@ -828,6 +864,8 @@
           was not found in ADOM {{ target_adom }}
           after authorization.
 
+          The ADOM lookup was retried for up to 60 seconds.
+
         success_msg: >-
           FortiGate {{ device_serial }}
           is now present in ADOM {{ target_adom }}.
@@ -837,7 +875,7 @@
 
 
     # ============================================================
-    # 30. DISPLAY AUTHORIZED DEVICE
+    # 29. DISPLAY AUTHORIZED DEVICE
     # ============================================================
 
     - name: Display authorized device
@@ -862,7 +900,7 @@
 
 
     # ============================================================
-    # 31. DETERMINE TARGET VDOM OID
+    # 30. DETERMINE TARGET VDOM OID
     # ============================================================
 
     - name: Determine target VDOM OID
@@ -886,18 +924,21 @@
 
 
     # ============================================================
-    # 32. DISPLAY VDOM INFORMATION
+    # 31. DISPLAY VDOM INFORMATION
     # ============================================================
 
     - name: Display VDOM information
       ansible.builtin.debug:
 
         msg:
+
           - "=============================================="
           - "VDOM"
           - "=============================================="
+
           - "VDOM     : {{ device_vdom }}"
           - "VDOM OID : {{ target_vdom_oid }}"
+
           - "=============================================="
 
       when:
@@ -905,7 +946,7 @@
 
 
     # ============================================================
-    # 33. ASSIGN POLICY PACKAGE
+    # 32. ASSIGN POLICY PACKAGE
     # ============================================================
 
     - name: Assign policy package
@@ -957,7 +998,7 @@
 
 
     # ============================================================
-    # 34. DISPLAY POLICY ASSIGNMENT RESULT
+    # 33. DISPLAY POLICY ASSIGNMENT RESULT
     # ============================================================
 
     - name: Display policy assignment result
@@ -970,7 +1011,7 @@
 
 
     # ============================================================
-    # 35. VERIFY POLICY ASSIGNMENT
+    # 34. VERIFY POLICY ASSIGNMENT
     # ============================================================
 
     - name: Verify policy package assignment
@@ -1009,7 +1050,7 @@
 
 
     # ============================================================
-    # 36. FINAL SUMMARY
+    # 35. FINAL SUMMARY
     # ============================================================
 
     - name: Display final Step 3 summary
@@ -1042,7 +1083,7 @@
 
 
     # ============================================================
-    # 37. LOGOUT
+    # 36. LOGOUT
     # ============================================================
 
     - name: Logout from FortiManager
