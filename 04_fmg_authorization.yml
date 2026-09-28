@@ -27,7 +27,7 @@
   tasks:
 
     # ============================================================
-    # 0. SELECT FIREWALL FROM NETBOX SERIAL
+    # 0. FIND FIREWALL FROM NETBOX SERIAL
     # ============================================================
 
     - name: Find firewall in firewalls.vars using NetBox asset_tag
@@ -35,47 +35,38 @@
         selected_firewall: >-
           {{
             firewalls
-            | selectattr('serial', 'equalto', asset_tag | default(''))
+            | selectattr('serial', 'defined')
+            | selectattr(
+                'serial',
+                'equalto',
+                asset_tag | default('')
+              )
             | list
             | first
             | default({})
           }}
 
-    # ============================================================
-    # 0.1 VERIFY NETBOX SERIAL
-    # ============================================================
-
-    - name: Verify NetBox serial is available
-      ansible.builtin.assert:
-        that:
-          - asset_tag is defined
-          - asset_tag | string | length > 0
-        fail_msg: >-
-          NetBox asset_tag is not available for host
-          {{ inventory_hostname }}.
-          The FortiGate serial must come from NetBox asset_tag.
-
-        success_msg: >-
-          NetBox serial detected:
-          {{ asset_tag }}
 
     # ============================================================
-    # 0.2 VERIFY FIREWALL EXISTS IN FIREWALLS.VARS
+    # 0.1 SKIP FIREWALL NOT DEFINED IN FIREWALLS.VARS
     # ============================================================
 
-    - name: Verify firewall exists in firewalls.vars
-      ansible.builtin.assert:
-        that:
-          - selected_firewall | length > 0
-        fail_msg: >-
-          No firewall definition was found in firewalls.vars
-          for NetBox serial {{ asset_tag }}.
+    - name: Display skipped firewall
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPING {{ inventory_hostname }}.
+          NetBox serial {{ asset_tag | default('unknown') }}
+          is not defined in firewalls.vars.
+      when: selected_firewall | length == 0
 
-        success_msg: >-
-          Firewall {{ asset_tag }} found in firewalls.vars.
+
+    - name: Stop processing firewall not defined in firewalls.vars
+      ansible.builtin.meta: end_host
+      when: selected_firewall | length == 0
+
 
     # ============================================================
-    # 0.3 VERIFY REQUIRED FIREWALL VARIABLES
+    # 0.2 VERIFY REQUIRED FIREWALL VARIABLES
     # ============================================================
 
     - name: Verify required firewall variables
@@ -93,18 +84,23 @@
           - selected_firewall.policy_package | length > 0
 
         fail_msg: >-
-          The firewall definition for serial {{ asset_tag }}
-          is incomplete in firewalls.vars.
+          Firewall {{ asset_tag }}
+          exists in firewalls.vars but its definition is incomplete.
 
           Required fields:
-          serial, hostname, management_ip,
-          target_vdom, policy_package.
+          serial,
+          hostname,
+          management_ip,
+          target_vdom,
+          policy_package.
 
         success_msg: >-
-          Firewall definition is complete.
+          Firewall {{ asset_tag }}
+          is correctly defined in firewalls.vars.
+
 
     # ============================================================
-    # 0.4 SAVE DYNAMIC FIREWALL VARIABLES
+    # 0.3 SAVE DYNAMIC FORTIGATE VARIABLES
     # ============================================================
 
     - name: Set dynamic FortiGate variables
@@ -113,8 +109,9 @@
         device_vdom: "{{ selected_firewall.target_vdom }}"
         policy_package: "{{ selected_firewall.policy_package }}"
 
+
     # ============================================================
-    # 0.5 DISPLAY SELECTED FIREWALL
+    # 0.4 DISPLAY SELECTED FIREWALL
     # ============================================================
 
     - name: Display selected firewall
@@ -125,11 +122,11 @@
           - "=============================================="
           - "NetBox Host       : {{ inventory_hostname }}"
           - "NetBox Asset Tag  : {{ asset_tag }}"
-          - "Serial            : {{ selected_firewall.serial }}"
+          - "Serial            : {{ device_serial }}"
           - "Hostname          : {{ selected_firewall.hostname }}"
           - "Management IP     : {{ selected_firewall.management_ip }}"
-          - "Target VDOM       : {{ selected_firewall.target_vdom }}"
-          - "Policy Package    : {{ selected_firewall.policy_package }}"
+          - "Target VDOM       : {{ device_vdom }}"
+          - "Policy Package    : {{ policy_package }}"
           - "Target ADOM       : {{ target_adom }}"
           - "=============================================="
 
