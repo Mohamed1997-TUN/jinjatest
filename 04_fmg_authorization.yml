@@ -16,7 +16,7 @@
     fmg_validate_certs: false
 
     # Unauthorized/unregistered devices always land in root.
-    # This is only used as the initial lookup context.
+    # This is only used for the initial lookup.
     source_adom: "root"
 
     # Destination ADOM
@@ -30,16 +30,16 @@
     # ============================================================
     #
     # IMPORTANT:
-    # Do NOT use firewalls.vars under vars_files.
     #
-    # The file contains values such as:
+    # firewalls.vars is intentionally NOT included under
+    # vars_files because it contains api_token values such as:
     #
-    # api_token: "{{ vault_milano_api_token }}"
+    #   api_token: "{{ vault_xxx_api_token }}"
     #
-    # Those variables are not required for this step.
+    # Those variables are not required for this workflow.
     #
-    # Reading the file as raw YAML prevents Ansible from trying
-    # to evaluate those unrelated vault variables.
+    # We therefore read firewalls.vars as raw YAML and only
+    # consume the fields required by this playbook.
     # ============================================================
 
     - name: Read firewalls.vars as raw YAML
@@ -48,14 +48,31 @@
           {{
             lookup(
               'ansible.builtin.file',
-              playbook_dir ~ '/../vars/firewalls.vars'
+              playbook_dir + '/vars/firewalls.vars'
             )
             | from_yaml
           }}
 
 
     # ============================================================
-    # 1. FIND FIREWALL USING NETBOX SERIAL
+    # 1. VERIFY firewalls DATA
+    # ============================================================
+
+    - name: Verify firewalls data was loaded
+      ansible.builtin.assert:
+        that:
+          - firewall_data is defined
+          - firewall_data.firewalls is defined
+          - firewall_data.firewalls | length > 0
+        fail_msg: >-
+          Unable to load firewall definitions from
+          {{ playbook_dir }}/vars/firewalls.vars.
+        success_msg: >-
+          Firewall definitions loaded successfully.
+
+
+    # ============================================================
+    # 2. FIND FIREWALL USING NETBOX SERIAL
     # ============================================================
     #
     # NetBox asset_tag = FortiGate serial
@@ -81,7 +98,7 @@
 
 
     # ============================================================
-    # 2. SKIP FIREWALL NOT DEFINED IN firewalls.vars
+    # 3. SKIP FIREWALL NOT DEFINED IN firewalls.vars
     # ============================================================
 
     - name: Display skipped firewall
@@ -99,12 +116,10 @@
 
 
     # ============================================================
-    # 3. EXTRACT ONLY REQUIRED INFORMATION
+    # 4. EXTRACT ONLY REQUIRED INFORMATION
     # ============================================================
     #
-    # We deliberately do NOT copy api_token.
-    #
-    # Required by this workflow:
+    # We intentionally consume only:
     #
     #   serial
     #   hostname
@@ -112,7 +127,8 @@
     #   target_vdom
     #   policy_package
     #
-    # management_mask and api_token are ignored.
+    # api_token is ignored.
+    # management_mask is ignored.
     # ============================================================
 
     - name: Extract required firewall information
@@ -125,7 +141,7 @@
 
 
     # ============================================================
-    # 4. VERIFY REQUIRED FIREWALL VARIABLES
+    # 5. VERIFY REQUIRED FIREWALL VARIABLES
     # ============================================================
 
     - name: Verify required firewall variables
@@ -161,7 +177,7 @@
 
 
     # ============================================================
-    # 5. DISPLAY SELECTED FIREWALL
+    # 6. DISPLAY SELECTED FIREWALL
     # ============================================================
 
     - name: Display selected firewall
@@ -185,7 +201,7 @@
 
 
     # ============================================================
-    # 6. LOGIN TO FORTIMANAGER
+    # 7. LOGIN TO FORTIMANAGER
     # ============================================================
 
     - name: Login to FortiManager
@@ -218,7 +234,7 @@
 
 
     # ============================================================
-    # 7. VERIFY LOGIN
+    # 8. VERIFY LOGIN
     # ============================================================
 
     - name: Verify FortiManager authentication
@@ -236,7 +252,7 @@
 
 
     # ============================================================
-    # 8. SAVE SESSION
+    # 9. SAVE SESSION
     # ============================================================
 
     - name: Save FortiManager session
@@ -248,7 +264,7 @@
 
 
     # ============================================================
-    # 9. FIND TARGET FORTIGATE IN GLOBAL DEVICE TABLE
+    # 10. FIND TARGET FORTIGATE IN GLOBAL DEVICE TABLE
     # ============================================================
 
     - name: Find target FortiGate by serial
@@ -290,7 +306,7 @@
 
 
     # ============================================================
-    # 10. EXTRACT TARGET FORTIGATE
+    # 11. EXTRACT TARGET FORTIGATE
     # ============================================================
 
     - name: Extract target FortiGate
@@ -305,7 +321,7 @@
 
 
     # ============================================================
-    # 11. VERIFY TARGET FORTIGATE
+    # 12. VERIFY TARGET FORTIGATE
     # ============================================================
 
     - name: Verify target FortiGate exists
@@ -329,7 +345,7 @@
 
 
     # ============================================================
-    # 12. DISPLAY DISCOVERED FORTIGATE
+    # 13. DISPLAY DISCOVERED FORTIGATE
     # ============================================================
 
     - name: Display discovered FortiGate
@@ -355,7 +371,7 @@
 
 
     # ============================================================
-    # 13. AUTHORIZE FORTIGATE DIRECTLY INTO TARGET ADOM
+    # 14. AUTHORIZE FORTIGATE DIRECTLY INTO TARGET ADOM
     # ============================================================
 
     - name: Authorize FortiGate into target ADOM
@@ -406,7 +422,7 @@
 
 
     # ============================================================
-    # 14. VERIFY AUTHORIZE REQUEST
+    # 15. VERIFY AUTHORIZE REQUEST
     # ============================================================
 
     - name: Verify authorize request
@@ -438,7 +454,7 @@
 
 
     # ============================================================
-    # 15. SAVE AUTHORIZE TASK ID
+    # 16. SAVE AUTHORIZE TASK ID
     # ============================================================
 
     - name: Save authorize task ID
@@ -451,7 +467,7 @@
 
 
     # ============================================================
-    # 16. DISPLAY AUTHORIZE TASK ID
+    # 17. DISPLAY AUTHORIZE TASK ID
     # ============================================================
 
     - name: Display authorize task ID
@@ -469,7 +485,7 @@
 
 
     # ============================================================
-    # 17. WAIT FOR AUTHORIZE TASK
+    # 18. WAIT FOR AUTHORIZE TASK
     # ============================================================
 
     - name: Wait for FortiManager authorize task
@@ -525,7 +541,7 @@
 
 
     # ============================================================
-    # 18. DISPLAY AUTHORIZE TASK RESULT
+    # 19. DISPLAY AUTHORIZE TASK RESULT
     # ============================================================
 
     - name: Display authorize task result
@@ -535,7 +551,7 @@
 
 
     # ============================================================
-    # 19. VERIFY AUTHORIZE TASK
+    # 20. VERIFY AUTHORIZE TASK
     # ============================================================
 
     - name: Verify authorize task completed
@@ -569,7 +585,7 @@
 
 
     # ============================================================
-    # 20. WAIT FOR DVM CACHE SYNCHRONIZATION
+    # 21. WAIT FOR DVM CACHE SYNCHRONIZATION
     # ============================================================
 
     - name: Wait for DVM cache synchronization
@@ -578,7 +594,7 @@
 
 
     # ============================================================
-    # 21. GET DEVICES FROM TARGET ADOM
+    # 22. GET DEVICES FROM TARGET ADOM
     # ============================================================
 
     - name: Get devices from target ADOM
@@ -615,7 +631,7 @@
 
 
     # ============================================================
-    # 22. VERIFY TARGET ADOM QUERY
+    # 23. VERIFY TARGET ADOM QUERY
     # ============================================================
 
     - name: Verify target ADOM query
@@ -634,7 +650,7 @@
 
 
     # ============================================================
-    # 23. FIND FORTIGATE IN TARGET ADOM
+    # 24. FIND FORTIGATE IN TARGET ADOM
     # ============================================================
 
     - name: Find FortiGate in target ADOM
@@ -652,7 +668,7 @@
 
 
     # ============================================================
-    # 24. VERIFY FORTIGATE IS IN TARGET ADOM
+    # 25. VERIFY FORTIGATE IS IN TARGET ADOM
     # ============================================================
 
     - name: Verify FortiGate is in target ADOM
@@ -672,7 +688,7 @@
 
 
     # ============================================================
-    # 25. DISPLAY AUTHORIZED DEVICE
+    # 26. DISPLAY AUTHORIZED DEVICE
     # ============================================================
 
     - name: Display authorized device
@@ -694,7 +710,7 @@
 
 
     # ============================================================
-    # 26. DETERMINE VDOM OID
+    # 27. DETERMINE VDOM OID
     # ============================================================
 
     - name: Determine target VDOM OID
@@ -714,7 +730,7 @@
 
 
     # ============================================================
-    # 27. DISPLAY VDOM INFORMATION
+    # 28. DISPLAY VDOM INFORMATION
     # ============================================================
 
     - name: Display VDOM information
@@ -733,7 +749,7 @@
 
 
     # ============================================================
-    # 28. ASSIGN POLICY PACKAGE
+    # 29. ASSIGN POLICY PACKAGE
     # ============================================================
 
     - name: Assign policy package
@@ -782,7 +798,7 @@
 
 
     # ============================================================
-    # 29. DISPLAY POLICY ASSIGNMENT RESULT
+    # 30. DISPLAY POLICY ASSIGNMENT RESULT
     # ============================================================
 
     - name: Display policy assignment result
@@ -792,7 +808,7 @@
 
 
     # ============================================================
-    # 30. VERIFY POLICY ASSIGNMENT
+    # 31. VERIFY POLICY ASSIGNMENT
     # ============================================================
 
     - name: Verify policy package assignment
@@ -825,7 +841,7 @@
 
 
     # ============================================================
-    # 31. FINAL SUMMARY
+    # 32. FINAL SUMMARY
     # ============================================================
 
     - name: Display final Step 3 summary
@@ -854,7 +870,7 @@
 
 
     # ============================================================
-    # 32. LOGOUT
+    # 33. LOGOUT
     # ============================================================
 
     - name: Logout from FortiManager
