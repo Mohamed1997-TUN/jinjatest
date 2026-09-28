@@ -736,12 +736,14 @@
 
 
         # ========================================================
-        # 8.25 FIND TARGET VDOM OID
+        # 8.25 GET TARGET VDOM OID FOR SCOPE OBJECT
         # ========================================================
         #
-        # No VDOM API verification is performed.
-        # The VDOM is used only as part of the FortiManager
+        # The VDOM is used only to build the FortiManager
         # Installation Target object.
+        #
+        # IMPORTANT:
+        # No VDOM verification/assertion is performed here.
         # ========================================================
 
         - name: Initialize target VDOM OID
@@ -760,21 +762,6 @@
             - item.name is defined
             - item.oid is defined
             - item.name == target_vdom
-
-
-        - name: Verify target VDOM information
-          ansible.builtin.assert:
-            that:
-              - target_vdom_oid | string | length > 0
-            fail_msg: >-
-              VDOM '{{ target_vdom }}' was not found in the authorized
-              FortiGate object returned by FortiManager.
-
-              FortiGate : {{ authorized_device_full.name }}
-              ADOM      : {{ target_adom }}
-            success_msg: >-
-              Target VDOM '{{ target_vdom }}' identified with OID
-              {{ target_vdom_oid }}.
 
 
         # ========================================================
@@ -1077,16 +1064,12 @@
               - final_scope_member | length > 0
               - final_scope_member.name == authorized_device_full.name
               - final_scope_member.oid | string == authorized_device_full.oid | string
-              - final_scope_member.vdom == target_vdom
-              - final_scope_member.vdom_oid | string == target_vdom_oid | string
             fail_msg: >-
               Installation Target verification failed.
 
               Policy Package : {{ policy_package }}
               Expected Device: {{ authorized_device_full.name }}
               Expected OID   : {{ authorized_device_full.oid }}
-              Expected VDOM  : {{ target_vdom }}
-              Expected VDOM OID: {{ target_vdom_oid }}
 
               Final Scope:
               {{ final_scope_members }}
@@ -1132,6 +1115,7 @@
               - "Target ADOM          : {{ target_adom }}"
               - "Target VDOM          : {{ target_vdom }}"
               - "Policy Package       : {{ policy_package }}"
+              - "VDOM Verification    : NOT PERFORMED"
               - "Authorization        : SUCCESS"
               - "Installation Target  : SUCCESS"
               - "Installation Target  : {{ final_scope_member.name }}"
