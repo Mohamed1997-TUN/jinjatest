@@ -5,7 +5,7 @@
   gather_facts: false
 
   vars_files:
-    - ../vars/fortimanager.vars
+    - vars/fortimanager.vars
 
   vars:
     fmg_validate_certs: false
@@ -16,11 +16,14 @@
     # 1. READ FIREWALL DATABASE
     # ============================================================
     #
-    # Do not load firewalls.vars through vars_files because it may
-    # contain vault_* references for multiple FortiGates.
+    # firewalls.vars is intentionally NOT loaded through vars_files.
     #
-    # Read it as raw YAML and select only the device represented by
-    # the current NetBox inventory host.
+    # Reason:
+    # firewalls.vars contains vault_* references for multiple
+    # FortiGates. We only want to select the firewall associated
+    # with the current NetBox asset_tag.
+    #
+    # The YAML file is therefore loaded as raw data.
     # ============================================================
 
     - name: Read firewall database
@@ -29,7 +32,7 @@
           {{
             lookup(
               'ansible.builtin.file',
-              playbook_dir + '/../vars/firewalls.vars'
+              playbook_dir + '/vars/firewalls.vars'
             )
             | from_yaml
           }}
@@ -59,7 +62,7 @@
     # 3. SKIP UNKNOWN FIREWALL
     # ============================================================
 
-    - name: Display unknown firewall
+    - name: Display firewall not present in database
       ansible.builtin.debug:
         msg:
           - "=============================================="
@@ -89,15 +92,18 @@
         that:
           - selected_firewall.serial is defined
           - selected_firewall.hostname is defined
+          - selected_firewall.management_ip is defined
           - selected_firewall.target_adom is defined
 
         fail_msg: >-
           Firewall {{ asset_tag }}
-          exists in firewalls.vars but is missing required fields.
+          exists in firewalls.vars but one or more required fields
+          are missing.
 
           Required:
           serial
           hostname
+          management_ip
           target_adom
 
         success_msg: >-
@@ -120,15 +126,16 @@
     # 6. NORMALIZE SERIAL FOR COMPARISON
     # ============================================================
     #
-    # Example:
+    # NetBox / firewalls.vars:
     #
-    # NetBox:
     #   FGVMEVP1E5VM0ED
     #
     # FortiManager:
+    #
     #   FGVMEVP1_E5VM0ED
     #
-    # The original values are never modified.
+    # Only the comparison value is normalized.
+    # The original serial values remain untouched.
     # ============================================================
 
     - name: Normalize FortiGate serial
@@ -155,6 +162,7 @@
           - "Serial            : {{ device_serial }}"
           - "Normalized Serial : {{ normalized_device_serial }}"
           - "Desired Name      : {{ desired_name }}"
+          - "Management IP     : {{ selected_firewall.management_ip }}"
           - "Target ADOM       : {{ target_adom }}"
           - "=============================================="
 
@@ -228,9 +236,6 @@
 
         # ========================================================
         # 8.4 GET DEVICES FROM TARGET ADOM
-        # ========================================================
-        #
-        # target_adom comes from firewalls.vars.
         # ========================================================
 
         - name: Get FortiGate devices from target ADOM
@@ -388,7 +393,7 @@
         # 8.12 RENAME DEVICE
         # ========================================================
         #
-        # Only rename when the current name differs.
+        # Only rename when required.
         # ========================================================
 
         - name: Enforce desired FortiManager device name
@@ -420,8 +425,6 @@
 
           register: rename_result
 
-          no_log: true
-
           retries: 3
           delay: 3
 
@@ -429,6 +432,8 @@
             - rename_result.json.result is defined
             - rename_result.json.result | length > 0
             - rename_result.json.result[0].status.code | int == 0
+
+          no_log: true
 
           when:
             - rename_required | bool
@@ -491,12 +496,6 @@
 
         # ========================================================
         # 8.15 REFRESH DEVICE LIST
-        # ========================================================
-        #
-        # After a rename, refresh the DVM database before final
-        # verification.
-        #
-        # Retry protects against short propagation delays.
         # ========================================================
 
         - name: Refresh FortiManager device list
