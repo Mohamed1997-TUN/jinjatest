@@ -36,6 +36,8 @@
 
 - name: Step 6 - FortiManager Policy Package Installation
   hosts: all
+  # NetBox hosts may carry ansible_connection=ssh. FortiManager API calls
+  # are therefore explicitly delegated to the AWX execution controller.
   connection: local
   gather_facts: false
   serial: 1
@@ -246,6 +248,7 @@
 
         - name: Login to FortiManager
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -293,6 +296,7 @@
 
         - name: Get FortiGate devices from target ADOM
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -435,6 +439,7 @@
 
         - name: Get policy packages from target ADOM
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -550,6 +555,7 @@
 
         - name: Start FortiManager policy package installation
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -644,6 +650,7 @@
 
         - name: Poll FortiManager installation task
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -816,6 +823,7 @@
 
         - name: Logout from FortiManager
           ansible.builtin.uri:
+            delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
