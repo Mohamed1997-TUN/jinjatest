@@ -172,10 +172,11 @@
 
         - name: Login to FortiManager
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
+            status_code: "{{ range(200, 600) | list }}"
 
             headers:
               Content-Type: application/json
@@ -195,11 +196,40 @@
             return_content: true
 
           register: fmg_login
+          failed_when: false
           no_log: true
 
 
         # ========================================================
-        # 8.2 VERIFY LOGIN
+        # 8.2 DIAGNOSE LOGIN RESULT
+        # ========================================================
+
+        - name: Display safe FortiManager login diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "=============================================================="
+              - "FORTIMANAGER LOGIN DIAGNOSTICS"
+              - "=============================================================="
+              - "Execution controller : 127.0.0.1"
+              - "FortiManager         : {{ fortimanager_host }}"
+              - "HTTP status          : {{ fmg_login.status | default('NO_HTTP_RESPONSE') }}"
+              - >-
+                JSON-RPC code:
+                {{
+                  fmg_login.json.result[0].status.code
+                  | default('NO_JSONRPC_CODE')
+                }}
+              - >-
+                JSON-RPC message:
+                {{
+                  fmg_login.json.result[0].status.message
+                  | default(fmg_login.msg | default('NO_MESSAGE'))
+                }}
+              - "Session received     : {{ fmg_login.json.session is defined }}"
+              - "=============================================================="
+
+        # ========================================================
+        # 8.3 VERIFY LOGIN
         # ========================================================
 
         - name: Verify FortiManager authentication
@@ -216,7 +246,7 @@
 
 
         # ========================================================
-        # 8.3 SAVE SESSION
+        # 8.4 SAVE SESSION
         # ========================================================
 
         - name: Save FortiManager session
@@ -227,12 +257,12 @@
 
 
         # ========================================================
-        # 8.4 CHECK IF ALREADY AUTHORIZED
+        # 8.5 CHECK IF ALREADY AUTHORIZED
         # ========================================================
 
         - name: Check target ADOM for existing FortiGate
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -257,7 +287,7 @@
 
 
         # ========================================================
-        # 8.5 INITIALIZE AUTHORIZED DEVICE
+        # 8.6 INITIALIZE AUTHORIZED DEVICE
         # ========================================================
 
         - name: Initialize authorized device
@@ -266,7 +296,7 @@
 
 
         # ========================================================
-        # 8.6 FIND DEVICE IN TARGET ADOM
+        # 8.7 FIND DEVICE IN TARGET ADOM
         # ========================================================
 
         - name: Find existing FortiGate in target ADOM
@@ -290,7 +320,7 @@
 
 
         # ========================================================
-        # 8.7 DISPLAY ALREADY AUTHORIZED
+        # 8.8 DISPLAY ALREADY AUTHORIZED
         # ========================================================
 
         - name: Display already authorized FortiGate
@@ -310,12 +340,12 @@
 
 
         # ========================================================
-        # 8.8 GET GLOBAL DVM DATABASE
+        # 8.9 GET GLOBAL DVM DATABASE
         # ========================================================
 
         - name: Get FortiGates from global DVM database
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -374,7 +404,7 @@
 
 
         # ========================================================
-        # 8.9 INITIALIZE TARGET DEVICE
+        # 8.10 INITIALIZE TARGET DEVICE
         # ========================================================
 
         - name: Initialize target device
@@ -386,7 +416,7 @@
 
 
         # ========================================================
-        # 8.10 FIND TARGET DEVICE
+        # 8.11 FIND TARGET DEVICE
         # ========================================================
 
         - name: Find target FortiGate in DVM database
@@ -411,7 +441,7 @@
 
 
         # ========================================================
-        # 8.11 VERIFY TARGET DEVICE
+        # 8.12 VERIFY TARGET DEVICE
         # ========================================================
 
         - name: Verify target FortiGate exists
@@ -432,7 +462,7 @@
 
 
         # ========================================================
-        # 8.12 DISPLAY DEVICE
+        # 8.13 DISPLAY DEVICE
         # ========================================================
 
         - name: Display discovered FortiGate
@@ -453,7 +483,7 @@
 
 
         # ========================================================
-        # 8.13 AUTHORIZE / PROMOTE DEVICE
+        # 8.14 AUTHORIZE / PROMOTE DEVICE
         # ========================================================
         #
         # The device name is taken from FortiManager.
@@ -461,7 +491,7 @@
 
         - name: Authorize FortiGate into target ADOM
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -500,7 +530,7 @@
 
 
         # ========================================================
-        # 8.14 VERIFY AUTHORIZATION REQUEST
+        # 8.15 VERIFY AUTHORIZATION REQUEST
         # ========================================================
 
         - name: Verify authorization request
@@ -534,7 +564,7 @@
 
 
         # ========================================================
-        # 8.15 SAVE TASK ID
+        # 8.16 SAVE TASK ID
         # ========================================================
 
         - name: Save authorization task ID
@@ -549,7 +579,7 @@
 
 
         # ========================================================
-        # 8.16 DISPLAY TASK
+        # 8.17 DISPLAY TASK
         # ========================================================
 
         - name: Display authorization task ID
@@ -566,12 +596,12 @@
 
 
         # ========================================================
-        # 8.17 POLL AUTHORIZATION TASK
+        # 8.18 POLL AUTHORIZATION TASK
         # ========================================================
 
         - name: Wait for FortiManager authorization task
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -614,7 +644,7 @@
 
 
         # ========================================================
-        # 8.18 VERIFY AUTHORIZATION TASK
+        # 8.19 VERIFY AUTHORIZATION TASK
         # ========================================================
 
         - name: Verify authorization task completed
@@ -646,7 +676,7 @@
 
 
         # ========================================================
-        # 8.19 VERIFY DEVICE IN TARGET ADOM
+        # 8.20 VERIFY DEVICE IN TARGET ADOM
         # ========================================================
         #
         # No VDOM logic here.
@@ -659,7 +689,7 @@
 
         - name: Wait for FortiGate to appear in target ADOM
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -708,7 +738,7 @@
 
 
         # ========================================================
-        # 8.20 FIND FINAL DEVICE
+        # 8.21 FIND FINAL DEVICE
         # ========================================================
 
         - name: Initialize final authorized device
@@ -737,7 +767,7 @@
 
 
         # ========================================================
-        # 8.21 VERIFY FINAL DEVICE
+        # 8.22 VERIFY FINAL DEVICE
         # ========================================================
 
         - name: Verify FortiGate authorization
@@ -756,7 +786,7 @@
 
 
         # ========================================================
-        # 8.22 ENSURE POLICY PACKAGE INSTALLATION TARGET
+        # 8.23 ENSURE POLICY PACKAGE INSTALLATION TARGET
         # ========================================================
         #
         # IMPORTANT:
@@ -775,7 +805,7 @@
 
         - name: Get target policy package
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -877,7 +907,7 @@
 
         - name: Add FortiGate to policy package Installation Targets
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -939,7 +969,7 @@
 
         - name: Re-read policy package after Installation Target update
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
@@ -1008,7 +1038,7 @@
 
 
         # ========================================================
-        # 8.23 DISPLAY FINAL RESULT
+        # 8.24 DISPLAY FINAL RESULT
         # ========================================================
 
         - name: Display authorization result
@@ -1037,7 +1067,7 @@
 
         - name: Logout from FortiManager
           ansible.builtin.uri:
-            delegate_to: localhost
+            delegate_to: 127.0.0.1
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
