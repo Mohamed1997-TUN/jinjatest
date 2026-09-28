@@ -1,0 +1,346 @@
+---
+- name: Step 00 - FortiGate Central Management via REST API
+  hosts: all
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/secrets.yml
+    - vars/fortimanager.vars
+
+  tasks:
+
+    # =========================================================
+    # 1. READ FIREWALL DATABASE
+    # =========================================================
+
+    - name: Read firewalls.vars as raw YAML
+      ansible.builtin.set_fact:
+        firewall_data: >-
+          {{
+            lookup(
+              'ansible.builtin.file',
+              playbook_dir + '/vars/firewalls.vars'
+            )
+            | from_yaml
+          }}
+
+    # =========================================================
+    # 2. SELECT FIREWALL USING NETBOX SERIAL
+    # =========================================================
+
+    - name: Select FortiGate from firewalls.vars using NetBox serial
+      ansible.builtin.set_fact:
+        selected_firewall: >-
+          {{
+            firewall_data.firewalls
+            | selectattr('serial', 'defined')
+            | selectattr(
+                'serial',
+                'equalto',
+                asset_tag | default('')
+              )
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Display NetBox selection
+      ansible.builtin.debug:
+        msg:
+          - "NetBox asset_tag : {{ asset_tag | default('NOT DEFINED') }}"
+          - "Selected serial  : {{ selected_firewall.serial | default('NOT FOUND') }}"
+          - "Hostname         : {{ selected_firewall.hostname | default('NOT FOUND') }}"
+          - "Management IP    : {{ selected_firewall.management_ip | default('NOT FOUND') }}"
+
+    # =========================================================
+    # 3. SKIP UNKNOWN FIREWALLS
+    # =========================================================
+
+    - name: Skip firewall if serial is not present in firewalls.vars
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "STEP 00 SKIPPED"
+          - "================================================"
+          - "NetBox serial {{ asset_tag | default('NOT DEFINED') }}"
+          - "is not present in firewalls.vars."
+          - "No FortiGate configuration will be performed."
+          - "================================================"
+      when:
+        - selected_firewall | length == 0
+
+    # =========================================================
+    # 4. CHECK SELECTED FIREWALL
+    # =========================================================
+
+    - name: Validate selected FortiGate
+      ansible.builtin.assert:
+        that:
+          - selected_firewall.serial is defined
+          - selected_firewall.hostname is defined
+          - selected_firewall.management_ip is defined
+          - selected_firewall.api_token is defined
+          - selected_firewall.api_token | length > 0
+        fail_msg: >-
+          FortiGate {{ asset_tag }} exists in firewalls.vars,
+          but one or more required fields are missing.
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 5. RESOLVE SELECTED API TOKEN
+    # =========================================================
+
+    - name: Extract vault variable name from selected API token
+      ansible.builtin.set_fact:
+        selected_api_token_variable: >-
+          {{
+            selected_firewall.api_token
+            | regex_replace(
+                '^\\s*{{\\s*([^}\\s]+)\\s*}}\\s*$',
+                '\\1'
+              )
+          }}
+      when:
+        - selected_firewall | length > 0
+
+    - name: Validate selected API token reference
+      ansible.builtin.assert:
+        that:
+          - selected_api_token_variable is defined
+          - selected_api_token_variable != selected_firewall.api_token
+        fail_msg: >-
+          The API token reference for
+          {{ selected_firewall.hostname }}
+          is not in the expected format.
+          Expected example:
+          {{ '{{ vault_staline_api_token }}' }}
+      when:
+        - selected_firewall | length > 0
+
+    - name: Resolve selected FortiGate API token
+      ansible.builtin.set_fact:
+        selected_api_token: >-
+          {{
+            lookup(
+              'ansible.builtin.vars',
+              selected_api_token_variable
+            )
+          }}
+      no_log: true
+      when:
+        - selected_firewall | length > 0
+
+    - name: Validate resolved API token
+      ansible.builtin.assert:
+        that:
+          - selected_api_token is defined
+          - selected_api_token | length > 0
+        fail_msg: >-
+          API token could not be resolved for
+          {{ selected_firewall.hostname }}.
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 6. CHECK FORTIMANAGER VARIABLES
+    # =========================================================
+
+    - name: Check FortiManager variables
+      ansible.builtin.assert:
+        that:
+          - fortimanager_host is defined
+          - fortimanager_host | length > 0
+          - fortimanager_serial is defined
+          - fortimanager_serial | length > 0
+        fail_msg: "FortiManager variables are missing."
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 7. GET CURRENT CENTRAL MANAGEMENT CONFIGURATION
+    # =========================================================
+
+    - name: Get current FortiGate Central Management configuration
+      ansible.builtin.uri:
+        url: >-
+          http://{{ selected_firewall.management_ip
+          }}/api/v2/cmdb/system/central-management?vdom=root
+        method: GET
+        headers:
+          Authorization: "Bearer {{ selected_api_token }}"
+          Accept: "application/json"
+        validate_certs: false
+        return_content: true
+        status_code:
+          - 200
+          - 401
+          - 403
+          - 404
+          - 500
+      register: central_management_get
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 8. DISPLAY API CONNECTIVITY PROBLEM
+    # =========================================================
+
+    - name: Display FortiGate API problem
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "STEP 00 - FORTIGATE API ERROR"
+          - "================================================"
+          - "FortiGate     : {{ selected_firewall.hostname }}"
+          - "Serial        : {{ selected_firewall.serial }}"
+          - "Management IP : {{ selected_firewall.management_ip }}"
+          - "HTTP status   : {{ central_management_get.status | default('N/A') }}"
+          - "The Central Management API did not return"
+          - "a valid HTTP 200 JSON response."
+          - "================================================"
+      when:
+        - selected_firewall | length > 0
+        - central_management_get.status | default(0) | int != 200
+          or central_management_get.json is not defined
+
+    # =========================================================
+    # 9. CONFIGURE CENTRAL MANAGEMENT
+    # =========================================================
+
+    - name: Configure FortiGate Central Management
+      ansible.builtin.uri:
+        url: >-
+          http://{{ selected_firewall.management_ip
+          }}/api/v2/cmdb/system/central-management?vdom=root
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ selected_api_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+        body_format: json
+        body:
+          type: "fortimanager"
+          fmg: "{{ fortimanager_host }}"
+          serial-number: "{{ fortimanager_serial }}"
+        validate_certs: false
+        return_content: true
+        status_code:
+          - 200
+          - 201
+      register: central_management_config
+      changed_when: true
+      failed_when: false
+      no_log: true
+      when:
+        - selected_firewall | length > 0
+        - central_management_get.status | default(0) | int == 200
+        - central_management_get.json is defined
+        - >
+          central_management_get.json.response.status | default('') != 'success'
+          or
+          central_management_get.json.response.results.type | default('none')
+          != 'fortimanager'
+          or
+          central_management_get.json.response.results.fmg | default('')
+          != '"' ~ fortimanager_host ~ '"'
+          or
+          central_management_get.json.response.results['serial-number']
+          | default('')
+          != '"' ~ fortimanager_serial ~ '"'
+
+    # =========================================================
+    # 10. VERIFY CENTRAL MANAGEMENT
+    # =========================================================
+
+    - name: Verify FortiGate Central Management configuration
+      ansible.builtin.uri:
+        url: >-
+          http://{{ selected_firewall.management_ip
+          }}/api/v2/cmdb/system/central-management?vdom=root
+        method: GET
+        headers:
+          Authorization: "Bearer {{ selected_api_token }}"
+          Accept: "application/json"
+        validate_certs: false
+        return_content: true
+        status_code:
+          - 200
+          - 401
+          - 403
+          - 404
+          - 500
+      register: central_management_verify
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 11. DISPLAY FINAL RESULT
+    # =========================================================
+
+    - name: Display Step 00 result
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "STEP 00 - CENTRAL MANAGEMENT RESULT"
+          - "=============================================="
+          - "FortiGate      : {{ selected_firewall.hostname }}"
+          - "Serial         : {{ selected_firewall.serial }}"
+          - "Management IP  : {{ selected_firewall.management_ip }}"
+          - "FortiManager   : {{ fortimanager_host }}"
+          - "FMG Serial     : {{ fortimanager_serial }}"
+          - >-
+            {{
+              'CONFIGURED'
+              if (
+                central_management_verify.status | default(0) | int == 200
+                and
+                central_management_verify.json.response.status
+                | default('') == 'success'
+                and
+                central_management_verify.json.response.results.type
+                | default('none') == 'fortimanager'
+                and
+                central_management_verify.json.response.results.fmg
+                | default('')
+                == '"' ~ fortimanager_host ~ '"'
+                and
+                central_management_verify.json.response.results['serial-number']
+                | default('')
+                == '"' ~ fortimanager_serial ~ '"'
+              )
+              else
+              'CONFIGURATION MISSING OR INCORRECT'
+            }}
+          - "=============================================="
+      when:
+        - selected_firewall | length > 0
+
+    # =========================================================
+    # 12. FINAL ASSERTION
+    # =========================================================
+
+    - name: Verify Central Management is correctly configured
+      ansible.builtin.assert:
+        that:
+          - central_management_verify.status | default(0) | int == 200
+          - central_management_verify.json is defined
+          - central_management_verify.json.response.status | default('') == 'success'
+          - central_management_verify.json.response.results.type | default('none') == 'fortimanager'
+          - central_management_verify.json.response.results.fmg | default('')
+            == '"' ~ fortimanager_host ~ '"'
+          - central_management_verify.json.response.results['serial-number'] | default('')
+            == '"' ~ fortimanager_serial ~ '"'
+        fail_msg: >-
+          Central Management verification failed for
+          {{ selected_firewall.hostname }}
+          ({{ selected_firewall.management_ip }}).
+      when:
+        - selected_firewall | length > 0
