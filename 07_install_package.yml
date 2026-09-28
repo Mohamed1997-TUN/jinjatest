@@ -540,57 +540,12 @@
 
 
         # ====================================================
-        # 13. VERIFY PACKAGE SCOPE BEFORE INSTALLATION
+        # 13. START POLICY PACKAGE INSTALLATION
         # ====================================================
         #
-        # Scope management is intentionally NOT performed here.
-        # The previous policy-package management step owns scope.
-        # This step only validates the expected member exists.
-        # ====================================================
-
-        - name: Resolve package scope members
-          ansible.builtin.set_fact:
-            package_scope_members: >-
-              {{
-                selected_package.get('scope member', [])
-                | default([], true)
-              }}
-
-
-        - name: Find target device and VDOM in package scope
-          ansible.builtin.set_fact:
-            package_scope_matches: >-
-              {{
-                package_scope_members
-                | selectattr('name', 'defined')
-                | selectattr('vdom', 'defined')
-                | selectattr('name', 'equalto', fmg_device_name)
-                | selectattr('vdom', 'equalto', target_vdom)
-                | list
-              }}
-
-
-        - name: Verify policy package scope
-          ansible.builtin.assert:
-            that:
-              - package_scope_matches | length >= 1
-            fail_msg: >-
-              Policy package '{{ policy_package }}' exists in ADOM
-              '{{ target_adom }}', but device '{{ fmg_device_name }}'
-              with VDOM '{{ target_vdom }}' is not a package scope member.
-              Run the policy-package management step first; installation
-              was intentionally blocked.
-            success_msg: >-
-              Package scope verified: '{{ fmg_device_name }}/{{ target_vdom }}'
-              is a member of '{{ policy_package }}'.
-
-
-        # ====================================================
-        # 14. START POLICY PACKAGE INSTALLATION
-        # ====================================================
-        #
-        # FortiManager 7.4.4+ expects pkg as an array in this API
-        # format. This is important for the user's FortiManager 7.4.x.
+        # Scope management and VDOM validation are intentionally
+        # handled outside this step. This step only installs the
+        # configured package on the resolved FortiManager device.
         # ====================================================
 
         - name: Start FortiManager policy package installation
@@ -792,7 +747,7 @@
 
 
         # ====================================================
-        # 17. FINAL INSTALLATION VERIFICATION
+        # 16. FINAL INSTALLATION VERIFICATION
         # ====================================================
 
         - name: Verify final policy package installation
