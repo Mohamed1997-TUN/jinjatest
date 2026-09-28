@@ -1,38 +1,45 @@
 ---
 # ============================================================
-# STEP 04
-# FORTIMANAGER AUTHORIZATION + INSTALLATION TARGET   (v2)
+# STEP 04 - FortiManager Authorization + Installation Target
+# ============================================================
 #
-# NetBox asset_tag
-#       |
-#       v
-# firewalls.vars (serial, hostname, management_ip,
-#                 target_adom, target_vdom, policy_package)
-#       |
-#       v
-# FortiManager DVM -> authorize (promote_unreg)
-#       |
-#       v
-# [NEW] task result check (state / num_err)
-# [NEW] readiness gate  (connected, IP + platform known)
-# [NEW] VDOM exists on the device
-#       |
-#       v
-# policy package -> scope member (name + vdom)
+# Source of truth:
+#   NetBox asset_tag
+#       ↓
+#   vars/firewalls.vars
 #
-# CHANGES vs v1 are marked with [NEW] / [CHANGED].
+# Responsibilities:
+#   1. Select firewall from firewalls.vars using NetBox asset_tag
+#   2. Validate required variables
+#   3. Login to FortiManager
+#   4. Check whether device is already managed in target ADOM
+#   5. If not managed:
+#        - Find unauthorized device globally by SERIAL
+#        - Normalize serial only for comparison
+#        - Authorize/promote it
+#        - Wait for task completion
+#   6. Refresh the managed device information
+#   7. Verify FMG device metadata
+#   8. Verify policy package exists
+#   9. Add device as Installation Target if missing
+#  10. Verify Installation Target
+#  11. Logout
 #
-# Optional vars (vault / fortimanager.vars):
-#   fortigate_admin_user / fortigate_admin_password
-#     -> sent in promote_unreg together with the management IP.
-#        Only needed if the FortiGate is NOT already connected
-#        to FMG through central-management.
-#
-# The original serial is NEVER modified.
-# Normalization is used ONLY for comparison.
+# IMPORTANT:
+#   - Do NOT use vars_files for firewalls.vars
+#   - FortiManager serial may contain "_"
+#       Example:
+#         NetBox/firewalls.vars : FGVMEVP1E5VM0ED
+#         FortiManager          : FGVMEVP1_E5VM0ED
+#   - Serial is normalized ONLY for comparison.
+#   - Do NOT modify the real serial value.
+#   - Installation Target API uses:
+#         name
+#         vdom
+#   - No independent VDOM verification is performed.
 # ============================================================
 
-- name: Step 04 - FortiManager Authorization and Installation Target
+- name: STEP 04 - FortiManager authorization and Installation Target
   hosts: all
   connection: local
   gather_facts: false
@@ -42,1174 +49,1369 @@
 
   vars:
 
-    fmg_validate_certs: false
+    # --------------------------------------------------------
+    # FortiManager API
+    # --------------------------------------------------------
+    fmg_jsonrpc_url: "https://{{ fortimanager_host }}/jsonrpc"
 
-    # Authorization retries
-    authorization_task_retries: 30
-    authorization_task_delay: 5
+    # --------------------------------------------------------
+    # Read firewalls.vars as RAW YAML.
+    #
+    # We intentionally DO NOT use:
+    #
+    # vars_files:
+    #   - vars/firewalls.vars
+    #
+    # because unrelated Jinja/vault variables in that file
+    # would otherwise be evaluated before we select our device.
+    # --------------------------------------------------------
+    firewall_data: >-
+      {{
+        lookup(
+          'ansible.builtin.file',
+          playbook_dir + '/vars/firewalls.vars'
+        )
+        | from_yaml
+      }}
 
-    authorization_device_retries: 12
-    authorization_device_delay: 5
+    # Supports both:
+    #
+    # firewalls:
+    #   - ...
+    #
+    # and a direct list.
+    firewall_records: >-
+      {{
+        firewall_data.firewalls
+        | default(firewall_data)
+      }}
 
-    # [NEW] Readiness gate (device must be connected and synced)
-    fmg_require_device_online: true
-    device_ready_retries: 24
-    device_ready_delay: 5
-
-    # Package retries
-    package_lookup_retries: 8
-    package_lookup_delay: 3
-
-    scope_lookup_retries: 8
-    scope_lookup_delay: 3
-
-    # [NEW] If a scope entry exists for the device with a DIFFERENT
-    # vdom, delete it and add it again with the right vdom.
-    fmg_fix_vdom_mismatch: true
-
+    # --------------------------------------------------------
+    # NetBox is the source of the serial.
+    # --------------------------------------------------------
+    netbox_asset_tag: >-
+      {{
+        hostvars[inventory_hostname]['asset_tag']
+        | default('')
+        | string
+        | trim
+      }}
 
   tasks:
 
-    # ==========================================================
-    # 1. READ FIREWALL DATABASE (raw YAML, no vault evaluation)
-    # ==========================================================
+    # ========================================================
+    # 1. BASIC INPUT VALIDATION
+    # ========================================================
 
-    - name: Read firewall database
-      ansible.builtin.set_fact:
-        firewall_data: >-
-          {{
-            lookup(
-              'ansible.builtin.file',
-              playbook_dir + '/vars/firewalls.vars'
-            )
-            | from_yaml
-          }}
-
-
-    # ==========================================================
-    # 2. SELECT FIREWALL USING NETBOX ASSET TAG
-    # ==========================================================
-
-    - name: Select firewall using NetBox asset tag
-      ansible.builtin.set_fact:
-        selected_firewall: >-
-          {{
-            firewall_data.firewalls
-            | selectattr('serial', 'equalto', asset_tag | default(''))
-            | list
-            | first
-            | default({})
-          }}
-
-
-    # ==========================================================
-    # 3/4. UNKNOWN FIREWALL
-    # ==========================================================
-
-    - name: Display firewall not present in firewall database
+    - name: Display NetBox asset_tag
       ansible.builtin.debug:
         msg:
-          - "============================================================"
-          - "FORTIGATE NOT FOUND IN FIREWALL DATABASE"
-          - "============================================================"
-          - "NetBox Asset Tag : {{ asset_tag | default('undefined') }}"
-          - "Action           : SKIPPED"
-          - "============================================================"
-      when:
-        - selected_firewall | length == 0
+          - "STEP 04"
+          - "NetBox inventory host : {{ inventory_hostname }}"
+          - "NetBox asset_tag      : {{ netbox_asset_tag }}"
 
-    - name: Stop processing unknown firewall
-      ansible.builtin.meta: end_host
-      when:
-        - selected_firewall | length == 0
+    - name: Fail if NetBox asset_tag is missing
+      ansible.builtin.assert:
+        that:
+          - netbox_asset_tag | length > 0
+        fail_msg: >-
+          NetBox asset_tag is empty for inventory host
+          '{{ inventory_hostname }}'.
+          The asset_tag must contain the FortiGate serial.
 
+    # ========================================================
+    # 2. SELECT FIREWALL FROM firewalls.vars
+    # ========================================================
 
-    # ==========================================================
-    # 5. VALIDATE FIREWALL DATA
-    # ==========================================================
+    - name: Select firewall definition using NetBox asset_tag
+      ansible.builtin.set_fact:
+        selected_firewalls: >-
+          {{
+            firewall_records
+            | selectattr('serial', 'defined')
+            | selectattr(
+                'serial',
+                'equalto',
+                netbox_asset_tag
+              )
+            | list
+          }}
 
-    - name: Validate selected firewall data
+    - name: Verify exactly one firewall definition was selected
+      ansible.builtin.assert:
+        that:
+          - selected_firewalls | length == 1
+        fail_msg: >-
+          Expected exactly one firewall definition in
+          vars/firewalls.vars for NetBox asset_tag
+          '{{ netbox_asset_tag }}',
+          but found {{ selected_firewalls | length }}.
+
+    - name: Set selected firewall
+      ansible.builtin.set_fact:
+        selected_firewall: "{{ selected_firewalls[0] }}"
+
+    # ========================================================
+    # 3. REQUIRED FIREWALL VARIABLES
+    # ========================================================
+
+    - name: Validate selected firewall definition
       ansible.builtin.assert:
         that:
           - selected_firewall.serial is defined
-          - selected_firewall.serial | length > 0
+          - selected_firewall.serial | string | length > 0
+
           - selected_firewall.hostname is defined
-          - selected_firewall.hostname | length > 0
+          - selected_firewall.hostname | string | length > 0
+
           - selected_firewall.management_ip is defined
-          - selected_firewall.management_ip | length > 0
+          - selected_firewall.management_ip | string | length > 0
+
           - selected_firewall.target_adom is defined
-          - selected_firewall.target_adom | length > 0
+          - selected_firewall.target_adom | string | length > 0
+
           - selected_firewall.target_vdom is defined
-          - selected_firewall.target_vdom | length > 0
+          - selected_firewall.target_vdom | string | length > 0
+
           - selected_firewall.policy_package is defined
-          - selected_firewall.policy_package | length > 0
+          - selected_firewall.policy_package | string | length > 0
+
         fail_msg: >-
-          FortiGate {{ asset_tag }} exists in firewalls.vars but required
-          parameters are missing. Required: serial, hostname,
-          management_ip, target_adom, target_vdom, policy_package
-        success_msg: >-
-          Firewall data for {{ selected_firewall.serial }} is valid.
+          The firewall definition for serial
+          '{{ selected_firewall.serial }}'
+          is missing one or more required attributes:
+          hostname, management_ip, target_adom,
+          target_vdom or policy_package.
 
+    # ========================================================
+    # 4. NORMALIZE SERIAL ONLY FOR COMPARISON
+    # ========================================================
+    #
+    # Example:
+    #
+    # firewalls.vars:
+    #   FGVMEVP1E5VM0ED
+    #
+    # FortiManager:
+    #   FGVMEVP1_E5VM0ED
+    #
+    # Both become:
+    #   FGVMEVP1E5VM0ED
+    #
+    # The original values are NEVER modified.
+    # ========================================================
 
-    # ==========================================================
-    # 6. SAVE TARGET VARIABLES
-    # ==========================================================
-
-    - name: Save selected firewall parameters
-      ansible.builtin.set_fact:
-        device_serial: "{{ selected_firewall.serial }}"
-        desired_hostname: "{{ selected_firewall.hostname }}"
-        management_ip: "{{ selected_firewall.management_ip }}"
-        target_adom: "{{ selected_firewall.target_adom }}"
-        target_vdom: "{{ selected_firewall.target_vdom }}"
-        policy_package: "{{ selected_firewall.policy_package }}"
-
-
-    # ==========================================================
-    # 7. NORMALIZE SERIAL (comparison only)
-    # ==========================================================
-
-    - name: Normalize FortiGate serial for comparison
+    - name: Normalize target serial for comparison
       ansible.builtin.set_fact:
         normalized_device_serial: >-
           {{
-            device_serial
+            selected_firewall.serial
+            | string
             | regex_replace('[^A-Za-z0-9]', '')
             | upper
           }}
 
-
-    # ==========================================================
-    # 8. DISPLAY TARGET INFORMATION
-    # ==========================================================
-
-    - name: Display selected FortiGate
+    - name: Display selected firewall
       ansible.builtin.debug:
         msg:
-          - "============================================================"
-          - "STEP 04 - FORTIGATE TARGET"
-          - "============================================================"
-          - "NetBox Asset Tag  : {{ asset_tag }}"
-          - "Serial            : {{ device_serial }}"
-          - "Normalized Serial : {{ normalized_device_serial }}"
-          - "Hostname          : {{ desired_hostname }}"
-          - "Management IP     : {{ management_ip }}"
-          - "Target ADOM       : {{ target_adom }}"
-          - "Target VDOM       : {{ target_vdom }}"
-          - "Policy Package    : {{ policy_package }}"
-          - "============================================================"
+          - "Selected firewall"
+          - "Serial          : {{ selected_firewall.serial }}"
+          - "Normalized      : {{ normalized_device_serial }}"
+          - "Hostname        : {{ selected_firewall.hostname }}"
+          - "Management IP   : {{ selected_firewall.management_ip }}"
+          - "Target ADOM     : {{ selected_firewall.target_adom }}"
+          - "Target VDOM     : {{ selected_firewall.target_vdom }}"
+          - "Policy Package  : {{ selected_firewall.policy_package }}"
 
+    # ========================================================
+    # 5. LOGIN TO FORTIMANAGER
+    # ========================================================
 
-    # ==========================================================
-    # 9. FORTIMANAGER WORKFLOW
-    # ==========================================================
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        body:
+          id: 1
+          method: exec
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+          verbose: 1
+        status_code: 200
+      register: fmg_login
+      no_log: true
 
-    - name: Execute FortiManager authorization and target workflow
+    - name: Validate FortiManager login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json.result is defined
+          - fmg_login.json.result | length > 0
+          - fmg_login.json.result[0].status.code | int == 0
+          - fmg_login.json.result[0].data.session is defined
+        fail_msg: >-
+          FortiManager login failed.
+
+    - name: Save FortiManager session
+      ansible.builtin.set_fact:
+        fmg_session: "{{ fmg_login.json.result[0].data.session }}"
+
+    - name: Display login success
+      ansible.builtin.debug:
+        msg: "FortiManager login successful."
+
+    # ========================================================
+    # Everything after login is inside a block so that the
+    # logout task always executes.
+    # ========================================================
+
+    - name: Execute Step 04 operations
       block:
 
-        # ======================================================
-        # 9.1 LOGIN
-        # ======================================================
+        # ====================================================
+        # 6. GET TARGET ADOM DEVICES
+        # ====================================================
 
-        - name: Login to FortiManager
+        - name: Get managed devices from target ADOM
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 1
-              method: "exec"
+              id: 10
+              method: get
               params:
-                - url: "/sys/login/user"
-                  data:
-                    user: "{{ fortimanager_user }}"
-                    passwd: "{{ fortimanager_password }}"
-            return_content: true
-          register: fmg_login
-          no_log: true
+                - url: "/dvmdb/adom/{{ selected_firewall.target_adom }}/device"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: target_adom_devices
 
-        - name: Verify FortiManager login
+        - name: Validate target ADOM API response
           ansible.builtin.assert:
             that:
-              - fmg_login.json.result is defined
-              - fmg_login.json.result | length > 0
-              - fmg_login.json.result[0].status.code | int == 0
-              - fmg_login.json.session is defined
-            fail_msg: FortiManager authentication failed.
-            success_msg: FortiManager authentication successful.
+              - target_adom_devices.json.result is defined
+              - target_adom_devices.json.result | length > 0
+              - target_adom_devices.json.result[0].status.code | int == 0
+            fail_msg: >-
+              FortiManager failed to retrieve devices from ADOM
+              '{{ selected_firewall.target_adom }}'.
 
-        - name: Save FortiManager session
+        - name: Build target ADOM device list
           ansible.builtin.set_fact:
-            fmg_session: "{{ fmg_login.json.session }}"
-          no_log: true
+            target_adom_device_list: >-
+              {{
+                target_adom_devices.json.result[0].data
+                | default([])
+              }}
 
+        # ====================================================
+        # 7. FIND DEVICE IN TARGET ADOM BY NORMALIZED SERIAL
+        # ====================================================
 
-        # ======================================================
-        # 9.4 DEVICES ALREADY IN TARGET ADOM
-        # ======================================================
-
-        - name: Get devices from target ADOM
-          ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
-            body_format: json
-            body:
-              id: 2
-              method: "get"
-              session: "{{ fmg_session }}"
-              params:
-                - url: "/dvmdb/adom/{{ target_adom }}/device"
-                  fields:
-                    - "name"
-                    - "sn"
-                    - "oid"
-                    - "ip"
-                    - "hostname"
-                    - "platform_str"
-                  loadsub: 0
-            return_content: true
-          register: target_adom_devices
-          no_log: true
-          retries: "{{ authorization_device_retries }}"
-          delay: "{{ authorization_device_delay }}"
-          until:
-            - target_adom_devices.json.result is defined
-            - target_adom_devices.json.result | length > 0
-            - target_adom_devices.json.result[0].status.code | int == 0
-
-        - name: Initialize authorized device
+        - name: Find target device in target ADOM
           ansible.builtin.set_fact:
-            authorized_device: {}
+            target_adom_matches: >-
+              {{
+                target_adom_device_list
+                | selectattr('sn', 'defined')
+                | selectattr(
+                    'sn',
+                    'match',
+                    '.*'
+                  )
+                | list
+                | selectattr(
+                    'sn',
+                    'defined'
+                  )
+                | list
+              }}
 
-        - name: Find FortiGate already present in target ADOM
+        - name: Filter target ADOM device using normalized serial
           ansible.builtin.set_fact:
-            authorized_device: "{{ item }}"
-          loop: >-
-            {{ target_adom_devices.json.result[0].data | default([]) }}
+            authorized_devices: >-
+              {{
+                target_adom_matches
+                | selectattr(
+                    'sn',
+                    'defined'
+                  )
+                | select(
+                    'extract',
+                    hostvars,
+                    inventory_hostname
+                  )
+                | list
+              }}
+          when: false
+
+        # ----------------------------------------------------
+        # Jinja selectattr cannot directly perform our regex
+        # normalization reliably in all Ansible versions.
+        #
+        # Build normalized serials explicitly.
+        # ----------------------------------------------------
+
+        - name: Initialize target ADOM serial matches
+          ansible.builtin.set_fact:
+            target_adom_serial_matches: []
+
+        - name: Build normalized serial list from target ADOM
+          ansible.builtin.set_fact:
+            target_adom_serial_matches: >-
+              {{
+                target_adom_serial_matches
+                +
+                (
+                  [item]
+                  if
+                  (
+                    item.sn is defined
+                    and
+                    (
+                      item.sn
+                      | string
+                      | regex_replace('[^A-Za-z0-9]', '')
+                      | upper
+                    )
+                    ==
+                    normalized_device_serial
+                  )
+                  else
+                  []
+                )
+              }}
+          loop: "{{ target_adom_device_list }}"
           loop_control:
-            label: "{{ item.name | default('') }}"
-          when:
-            - item.sn is defined
-            - >
-              (item.sn | regex_replace('[^A-Za-z0-9]', '') | upper)
-              == normalized_device_serial
+            label: "{{ item.name | default('unknown') }}"
 
-        - name: Display current authorization status
+        - name: Verify target ADOM serial uniqueness
+          ansible.builtin.assert:
+            that:
+              - target_adom_serial_matches | length <= 1
+            fail_msg: >-
+              Multiple devices in ADOM
+              '{{ selected_firewall.target_adom }}'
+              match serial '{{ selected_firewall.serial }}'.
+              FortiManager data is ambiguous; refusing to continue.
+
+        - name: Set authorization state
+          ansible.builtin.set_fact:
+            device_already_authorized: >-
+              {{
+                target_adom_serial_matches | length == 1
+              }}
+
+        # ====================================================
+        # 8. IF ALREADY AUTHORIZED
+        # ====================================================
+
+        - name: Set already authorized device
+          ansible.builtin.set_fact:
+            authorized_device: "{{ target_adom_serial_matches[0] }}"
+          when: device_already_authorized
+
+        - name: Display already authorized device
           ansible.builtin.debug:
             msg:
-              - "============================================================"
-              - "FORTIMANAGER AUTHORIZATION STATUS"
-              - "============================================================"
-              - "Serial       : {{ device_serial }}"
-              - "FMG Serial   : {{ authorized_device.sn | default('not found') }}"
-              - "Device Name  : {{ authorized_device.name | default('not found') }}"
-              - "Target ADOM  : {{ target_adom }}"
-              - >-
-                {{
-                  'ALREADY AUTHORIZED'
-                  if authorized_device | length > 0
-                  else 'NOT YET AUTHORIZED'
-                }}
-              - "============================================================"
+              - "Device is already authorized."
+              - "FMG name : {{ authorized_device.name }}"
+              - "Serial   : {{ authorized_device.sn }}"
+              - "IP       : {{ authorized_device.ip | default('unknown') }}"
+              - "Platform : {{ authorized_device.platform_str | default('unknown') }}"
+              - "OID      : {{ authorized_device.oid | default('unknown') }}"
+          when: device_already_authorized
 
+        # ====================================================
+        # 9. IF NOT AUTHORIZED:
+        #    SEARCH GLOBAL DEVICE DATABASE BY SERIAL
+        # ====================================================
 
-        # ======================================================
-        # 9.8 GLOBAL DVM (only when not yet authorized)
-        # Identify the device by normalized serial, not mgmt_mode.
-        # ======================================================
-
-        - name: Get global FortiManager DVM database
+        - name: Get global FortiManager device database
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 3
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 20
+              method: get
               params:
                 - url: "/dvmdb/device"
-                  fields:
-                    - "name"
-                    - "sn"
-                    - "oid"
-                    - "ip"
-                    - "hostname"
-                    - "platform_str"
-                    - "mgmt_mode"
-                  loadsub: 0
-            return_content: true
-          register: global_dvm
-          no_log: true
-          retries: 6
-          delay: 3
-          until:
-            - global_dvm.json.result is defined
-            - global_dvm.json.result | length > 0
-            - global_dvm.json.result[0].status.code | int == 0
-          when:
-            - authorized_device | length == 0
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: global_devices
+          when: not device_already_authorized
 
-        - name: Initialize target device
-          ansible.builtin.set_fact:
-            target_device: {}
-          when:
-            - authorized_device | length == 0
-
-        - name: Find FortiGate in global DVM
-          ansible.builtin.set_fact:
-            target_device: "{{ item }}"
-          loop: >-
-            {{ global_dvm.json.result[0].data | default([]) }}
-          loop_control:
-            label: "{{ item.name | default('') }}"
-          when:
-            - authorized_device | length == 0
-            - item.sn is defined
-            - >
-              (item.sn | regex_replace('[^A-Za-z0-9]', '') | upper)
-              == normalized_device_serial
-
-        - name: Verify FortiGate exists in global DVM
+        - name: Validate global device API response
           ansible.builtin.assert:
             that:
-              - target_device | length > 0
-              - target_device.name is defined
-              - target_device.sn is defined
+              - global_devices.json.result is defined
+              - global_devices.json.result | length > 0
+              - global_devices.json.result[0].status.code | int == 0
             fail_msg: >-
-              FortiGate {{ device_serial }} was not found in the
-              FortiManager DVM database. Expected normalized serial:
-              {{ normalized_device_serial }}
-            success_msg: >-
-              FortiGate {{ target_device.name }} was found in FortiManager DVM.
-          when:
-            - authorized_device | length == 0
+              FortiManager failed to retrieve the global device database.
+          when: not device_already_authorized
 
-        - name: Display FortiGate found in DVM
+        - name: Build global device list
+          ansible.builtin.set_fact:
+            global_device_list: >-
+              {{
+                global_devices.json.result[0].data
+                | default([])
+              }}
+          when: not device_already_authorized
+
+        # ====================================================
+        # 10. FIND UNAUTHORIZED DEVICE BY SERIAL
+        #
+        # IMPORTANT:
+        # Do NOT depend on mgmt_mode == "unreg".
+        #
+        # We already observed that FMG can expose:
+        #
+        #   mgmt_mode: 0
+        #
+        # while the device is visible under Unauthorized Devices.
+        #
+        # Therefore serial is the authoritative matching key.
+        # ====================================================
+
+        - name: Initialize global serial matches
+          ansible.builtin.set_fact:
+            global_serial_matches: []
+          when: not device_already_authorized
+
+        - name: Find global device using normalized serial
+          ansible.builtin.set_fact:
+            global_serial_matches: >-
+              {{
+                global_serial_matches
+                +
+                (
+                  [item]
+                  if
+                  (
+                    item.sn is defined
+                    and
+                    (
+                      item.sn
+                      | string
+                      | regex_replace('[^A-Za-z0-9]', '')
+                      | upper
+                    )
+                    ==
+                    normalized_device_serial
+                  )
+                  else
+                  []
+                )
+              }}
+          loop: "{{ global_device_list }}"
+          loop_control:
+            label: "{{ item.name | default('unknown') }}"
+          when: not device_already_authorized
+
+        - name: Verify global serial uniqueness
+          ansible.builtin.assert:
+            that:
+              - global_serial_matches | length == 1
+            fail_msg: >-
+              Expected exactly one FortiManager device matching serial
+              '{{ selected_firewall.serial }}',
+              but found {{ global_serial_matches | length }}.
+
+              The device may not be connected to FortiManager,
+              may have an unexpected serial, or may not be present
+              in the Unauthorized Devices database.
+          when: not device_already_authorized
+
+        - name: Set unauthorized device
+          ansible.builtin.set_fact:
+            unauthorized_device: "{{ global_serial_matches[0] }}"
+          when: not device_already_authorized
+
+        - name: Display unauthorized device selected for authorization
           ansible.builtin.debug:
             msg:
-              - "============================================================"
-              - "FORTIGATE FOUND IN FORTIMANAGER DVM"
-              - "============================================================"
-              - "Name       : {{ target_device.name }}"
-              - "Serial     : {{ target_device.sn }}"
-              - "IP         : {{ target_device.ip | default('n/a') }}"
-              - "OID        : {{ target_device.oid | default('n/a') }}"
-              - "Platform   : {{ target_device.platform_str | default('n/a') }}"
-              - "MGMT Mode  : {{ target_device.mgmt_mode | default('n/a') }}"
-              - "Target ADOM: {{ target_adom }}"
-              - "============================================================"
-          when:
-            - authorized_device | length == 0
+              - "Unauthorized device found."
+              - "FMG name : {{ unauthorized_device.name }}"
+              - "Serial   : {{ unauthorized_device.sn }}"
+              - "IP       : {{ unauthorized_device.ip | default('unknown') }}"
+              - "Platform : {{ unauthorized_device.platform_str | default('unknown') }}"
+              - "OID      : {{ unauthorized_device.oid | default('unknown') }}"
+          when: not device_already_authorized
 
+        # ====================================================
+        # 11. AUTHORIZE / PROMOTE
+        # ====================================================
+        #
+        # FortiManager requires the DEVICE NAME here, not the
+        # serial number.
+        #
+        # This is why we first locate the device by serial and
+        # then use unauthorized_device.name.
+        # ====================================================
 
-        # ======================================================
-        # 9.13 AUTHORIZE / PROMOTE DEVICE
-        # [CHANGED] payload is built first. IP + credentials are
-        # sent only when fortigate_admin_user is defined.
-        # ======================================================
-
-        - name: Build promote payload
-          ansible.builtin.set_fact:
-            promote_device_payload: >-
-              {{
-                {
-                  'name': target_device.name,
-                  'device action': 'promote_unreg'
-                }
-                | combine(
-                    {
-                      'ip': management_ip,
-                      'adm_usr': fortigate_admin_user,
-                      'adm_pass': fortigate_admin_password
-                    }
-                    if (fortigate_admin_user is defined
-                        and fortigate_admin_password is defined)
-                    else {}
-                  )
-              }}
-          no_log: true
-          when:
-            - authorized_device | length == 0
-
-        - name: Authorize FortiGate into target ADOM
+        - name: Authorize FortiGate in target ADOM
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 4
-              method: "exec"
-              session: "{{ fmg_session }}"
+              id: 30
+              method: exec
               params:
                 - url: "/dvm/cmd/add/device"
                   data:
-                    adom: "{{ target_adom }}"
-                    device: "{{ promote_device_payload }}"
+                    adom: "{{ selected_firewall.target_adom }}"
+                    device:
+                      name: "{{ unauthorized_device.name }}"
+                      "device action": "promote_unreg"
                     flags:
-                      - "create_task"
-                      - "nonblocking"
-            return_content: true
+                      - create_task
+                      - nonblocking
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
           register: authorization_response
-          no_log: true
-          when:
-            - authorized_device | length == 0
+          when: not device_already_authorized
 
-        - name: Extract authorization task ID
+        - name: Validate authorization response
+          ansible.builtin.assert:
+            that:
+              - authorization_response.json.result is defined
+              - authorization_response.json.result | length > 0
+              - authorization_response.json.result[0].status.code | int == 0
+              - >-
+                (
+                  authorization_response.json.result[0].data.task
+                  is defined
+                )
+                or
+                (
+                  authorization_response.json.result[0].data.taskid
+                  is defined
+                )
+            fail_msg: >-
+              FortiManager authorization request failed.
+          when: not device_already_authorized
+
+        - name: Save authorization task ID
           ansible.builtin.set_fact:
             authorization_task_id: >-
               {{
                 authorization_response.json.result[0].data.task
                 | default(
-                    authorization_response.json.result[0].data[0].task
-                    | default('')
+                    authorization_response.json.result[0].data.taskid
                   )
               }}
-          when:
-            - authorized_device | length == 0
+          when: not device_already_authorized
 
-        - name: Verify authorization task ID
-          ansible.builtin.assert:
-            that:
-              - authorization_task_id | string | length > 0
-            fail_msg: >-
-              FortiManager did not return an authorization task ID.
-              Device: {{ target_device.name }}
-            success_msg: >-
-              Authorization task created: {{ authorization_task_id }}
-          when:
-            - authorized_device | length == 0
+        - name: Display authorization task
+          ansible.builtin.debug:
+            msg: >-
+              Authorization task ID:
+              {{ authorization_task_id }}
+          when: not device_already_authorized
 
+        # ====================================================
+        # 12. MONITOR AUTHORIZATION TASK
+        # ====================================================
 
-        # ======================================================
-        # 9.16 POLL AUTHORIZATION TASK
-        # [CHANGED] waits for a terminal task state, not only for
-        # percent >= 100.
-        # Task states: 0 pending, 1 running, 2 cancelling,
-        # 3 cancelled, 4 done, 5 error, 6 aborting, 7 aborted,
-        # 8 warning.
-        # ======================================================
-
-        - name: Wait for FortiManager authorization task
+        - name: Wait for authorization task to complete
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 5
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 31
+              method: get
               params:
                 - url: "/task/task/{{ authorization_task_id }}"
-            return_content: true
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
           register: authorization_task_status
-          no_log: true
-          retries: "{{ authorization_task_retries }}"
-          delay: "{{ authorization_task_delay }}"
           until:
             - authorization_task_status.json.result is defined
             - authorization_task_status.json.result | length > 0
             - authorization_task_status.json.result[0].status.code | int == 0
-            - >
-              (authorization_task_status.json.result[0].data.state
-              | default(4) | int) in [3, 4, 5, 7, 8]
-          when:
-            - authorized_device | length == 0
+            - >-
+              (
+                authorization_task_status.json.result[0].data.percent
+                | default(0)
+                | int
+              ) >= 100
+          retries: 36
+          delay: 5
+          when: not device_already_authorized
 
-        # [CHANGED] status.code == 0 only means "API call OK".
-        # The real outcome is data.state and data.num_err.
-        - name: Verify authorization task result
+        - name: Validate authorization task result
           ansible.builtin.assert:
             that:
-              - authorization_task_status.json.result[0].status.code | int == 0
-              - authorization_task_status.json.result[0].data.state | default(4) | int == 4
               - authorization_task_status.json.result[0].data.num_err | default(0) | int == 0
-            fail_msg: >-
-              FortiManager authorization task did not finish cleanly.
-              Device: {{ target_device.name }}
-              State: {{ authorization_task_status.json.result[0].data.state | default('unknown') }}
-              Errors: {{ authorization_task_status.json.result[0].data.num_err | default('unknown') }}
-              (state 4 = done, 5 = error, 8 = warning)
-            success_msg: FortiManager authorization task completed successfully.
-          when:
-            - authorized_device | length == 0
+              - >-
+                authorization_task_status.json.result[0].data.percent
+                | default(0)
+                | int >= 100
+          fail_msg: >-
+            FortiManager authorization task completed with errors.
 
+            Task:
+            {{ authorization_task_status.json.result[0].data | to_nice_json }}
+          when: not device_already_authorized
 
-        # ======================================================
-        # 9.18 WAIT FOR DEVICE TO APPEAR IN TARGET ADOM
-        # ======================================================
+        - name: Display authorization success
+          ansible.builtin.debug:
+            msg: "FortiGate authorization completed successfully."
+          when: not device_already_authorized
 
-        - name: Wait for FortiGate to appear in target ADOM
+        # ====================================================
+        # 13. WAIT UNTIL DEVICE APPEARS IN TARGET ADOM
+        # ====================================================
+
+        - name: Wait for device to appear in target ADOM
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 6
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 40
+              method: get
               params:
-                - url: "/dvmdb/adom/{{ target_adom }}/device"
-                  fields:
-                    - "name"
-                    - "sn"
-                    - "oid"
-                    - "ip"
-                    - "hostname"
-                    - "platform_str"
-                  loadsub: 0
-            return_content: true
-          register: authorized_devices_response
-          no_log: true
-          retries: "{{ authorization_device_retries }}"
-          delay: "{{ authorization_device_delay }}"
+                - url: "/dvmdb/adom/{{ selected_firewall.target_adom }}/device"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: target_adom_devices_after_authorization
           until:
-            - authorized_devices_response.json.result is defined
-            - authorized_devices_response.json.result | length > 0
-            - authorized_devices_response.json.result[0].status.code | int == 0
-            - >
+            - target_adom_devices_after_authorization.json.result is defined
+            - target_adom_devices_after_authorization.json.result | length > 0
+            - target_adom_devices_after_authorization.json.result[0].status.code | int == 0
+            - >-
               (
-                authorized_devices_response.json.result[0].data
+                target_adom_devices_after_authorization.json.result[0].data
                 | default([])
-                | map(attribute='sn')
-                | select('defined')
-                | map('regex_replace', '[^A-Za-z0-9]', '')
-                | map('upper')
-                | select('equalto', normalized_device_serial)
+                | selectattr('sn', 'defined')
                 | list
                 | length
               ) > 0
+          retries: 12
+          delay: 5
+          when: not device_already_authorized
 
-        - name: Initialize final authorized device
-          ansible.builtin.set_fact:
-            authorized_device_final: {}
-
-        - name: Find final authorized FortiGate
-          ansible.builtin.set_fact:
-            authorized_device_final: "{{ item }}"
-          loop: >-
-            {{ authorized_devices_response.json.result[0].data | default([]) }}
-          loop_control:
-            label: "{{ item.name | default('') }}"
-          when:
-            - item.sn is defined
-            - >
-              (item.sn | regex_replace('[^A-Za-z0-9]', '') | upper)
-              == normalized_device_serial
-
-        - name: Verify FortiGate authorization
-          ansible.builtin.assert:
-            that:
-              - authorized_device_final | length > 0
-              - authorized_device_final.name is defined
-              - authorized_device_final.oid is defined
-              - authorized_device_final.sn is defined
-            fail_msg: >-
-              FortiGate {{ device_serial }} was not found in ADOM
-              {{ target_adom }} after authorization.
-            success_msg: >-
-              FortiGate {{ authorized_device_final.name }} is now
-              authorized in ADOM {{ target_adom }}.
-
-        - name: Verify FortiManager serial identity
-          ansible.builtin.assert:
-            that:
-              - >
-                (authorized_device_final.sn
-                | regex_replace('[^A-Za-z0-9]', '') | upper)
-                == normalized_device_serial
-            fail_msg: >-
-              Serial mismatch. NetBox: {{ device_serial }}
-              FortiManager: {{ authorized_device_final.sn }}
-              Normalized expected: {{ normalized_device_serial }}
-            success_msg: >-
-              Serial identity verified. FortiManager serial:
-              {{ authorized_device_final.sn }}
-
-
-        # ======================================================
-        # [NEW] 9.22a READINESS GATE
+        # ====================================================
+        # 14. REFRESH DEVICE INFORMATION
+        # ====================================================
         #
-        # An authorized device can still be an empty shell
-        # (no IP, no platform, not connected). That is exactly
-        # what the Install Wizard showed: empty IP + Platform.
-        # Do not touch the policy package until FMG really
-        # knows the device.
+        # THIS IS THE IMPORTANT ADDITION.
         #
-        # conn_status: 0 unknown, 1 up, 2 down
-        # ======================================================
+        # It reproduces the FortiManager "Refresh Device"
+        # operation and allows FMG to update its device metadata
+        # from the FortiGate.
+        #
+        # This should help ensure IP/platform information is
+        # populated before we create the Installation Target.
+        # ====================================================
 
-        - name: Wait until FortiGate is connected and known to FortiManager
+        - name: Get current managed device from target ADOM
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 10
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 50
+              method: get
               params:
-                - url: "/dvmdb/adom/{{ target_adom }}/device/{{ authorized_device_final.name }}"
-                  fields:
-                    - "name"
-                    - "sn"
-                    - "ip"
-                    - "platform_str"
-                    - "os_ver"
-                    - "conn_status"
-                    - "conf_status"
-                    - "dev_status"
-            return_content: true
-          register: managed_device
-          no_log: true
-          retries: "{{ device_ready_retries }}"
-          delay: "{{ device_ready_delay }}"
-          until:
-            - managed_device.json.result is defined
-            - managed_device.json.result | length > 0
-            - managed_device.json.result[0].status.code | int == 0
-            - managed_device.json.result[0].data.ip | default('') not in ['', '0.0.0.0']
-            - managed_device.json.result[0].data.platform_str | default('') | length > 0
-            - managed_device.json.result[0].data.conn_status | default(0) | int == 1
-          failed_when: false
-          when:
-            - fmg_require_device_online | bool
+                - url: "/dvmdb/adom/{{ selected_firewall.target_adom }}/device"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: refreshed_adom_devices
 
-        - name: Display device readiness
+        - name: Build refreshed ADOM device list
+          ansible.builtin.set_fact:
+            refreshed_adom_device_list: >-
+              {{
+                refreshed_adom_devices.json.result[0].data
+                | default([])
+              }}
+
+        - name: Initialize refreshed device matches
+          ansible.builtin.set_fact:
+            refreshed_device_matches: []
+
+        - name: Find refreshed device by normalized serial
+          ansible.builtin.set_fact:
+            refreshed_device_matches: >-
+              {{
+                refreshed_device_matches
+                +
+                (
+                  [item]
+                  if
+                  (
+                    item.sn is defined
+                    and
+                    (
+                      item.sn
+                      | string
+                      | regex_replace('[^A-Za-z0-9]', '')
+                      | upper
+                    )
+                    ==
+                    normalized_device_serial
+                  )
+                  else
+                  []
+                )
+              }}
+          loop: "{{ refreshed_adom_device_list }}"
+          loop_control:
+            label: "{{ item.name | default('unknown') }}"
+
+        - name: Verify exactly one managed device exists
+          ansible.builtin.assert:
+            that:
+              - refreshed_device_matches | length == 1
+            fail_msg: >-
+              After authorization, FortiManager does not contain exactly
+              one managed device matching serial
+              '{{ selected_firewall.serial }}'.
+
+              Matches found:
+              {{ refreshed_device_matches | to_nice_json }}
+
+        - name: Set managed device
+          ansible.builtin.set_fact:
+            authorized_device: "{{ refreshed_device_matches[0] }}"
+
+        - name: Display managed device before refresh
           ansible.builtin.debug:
             msg:
-              - "============================================================"
-              - "DEVICE READINESS IN FORTIMANAGER"
-              - "============================================================"
-              - "Name        : {{ authorized_device_final.name }}"
-              - "IP          : {{ managed_device.json.result[0].data.ip | default('EMPTY') }}"
-              - "Platform    : {{ managed_device.json.result[0].data.platform_str | default('EMPTY') }}"
-              - "OS version  : {{ managed_device.json.result[0].data.os_ver | default('n/a') }}"
-              - "conn_status : {{ managed_device.json.result[0].data.conn_status | default('n/a') }}  (1 = up)"
-              - "conf_status : {{ managed_device.json.result[0].data.conf_status | default('n/a') }}"
-              - "dev_status  : {{ managed_device.json.result[0].data.dev_status | default('n/a') }}"
-              - "============================================================"
-          when:
-            - fmg_require_device_online | bool
-            - managed_device.json is defined
+              - "Managed device found."
+              - "Name     : {{ authorized_device.name }}"
+              - "Serial   : {{ authorized_device.sn }}"
+              - "IP       : {{ authorized_device.ip | default('unknown') }}"
+              - "Platform : {{ authorized_device.platform_str | default('unknown') }}"
+              - "OID      : {{ authorized_device.oid | default('unknown') }}"
 
-        - name: Verify FortiGate is connected and fully known
-          ansible.builtin.assert:
-            that:
-              - managed_device.json.result is defined
-              - managed_device.json.result[0].status.code | int == 0
-              - managed_device.json.result[0].data.ip | default('') not in ['', '0.0.0.0']
-              - managed_device.json.result[0].data.platform_str | default('') | length > 0
-              - managed_device.json.result[0].data.conn_status | default(0) | int == 1
-            fail_msg: >-
-              {{ authorized_device_final.name }} is authorized but NOT
-              connected/synced in FortiManager (IP or platform empty, or
-              conn_status is not 1). Check on the FortiGate:
-              config system central-management (type fortimanager,
-              fmg = FMG IP), routing/firewall to TCP 541, fmg-source-ip.
-              If the FortiGate is not connected yet, also provide
-              fortigate_admin_user / fortigate_admin_password so the
-              promote request can carry the management IP and credentials.
-            success_msg: >-
-              {{ authorized_device_final.name }} is connected and synced.
-          when:
-            - fmg_require_device_online | bool
+        # ====================================================
+        # 15. REFRESH DEVICE
+        # ====================================================
 
-
-        # ======================================================
-        # [NEW] 9.22b VERIFY THE TARGET VDOM EXISTS ON THE DEVICE
-        # (checks the device, NOT the scope member format)
-        # ======================================================
-
-        - name: Get VDOMs of the managed device
+        - name: Refresh managed FortiGate information
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 11
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 60
+              method: exec
               params:
-                - url: "/dvmdb/adom/{{ target_adom }}/device/{{ authorized_device_final.name }}/vdom"
-            return_content: true
-          register: device_vdoms
-          no_log: true
-          retries: 5
-          delay: 3
-          until:
-            - device_vdoms.json.result is defined
-            - device_vdoms.json.result | length > 0
-            - device_vdoms.json.result[0].status.code | int == 0
+                - url: "/dvm/cmd/update/device"
+                  data:
+                    adom: "{{ selected_firewall.target_adom }}"
+                    device: "{{ authorized_device.name }}"
+                    flags:
+                      - create_task
+                      - nonblocking
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: refresh_device_response
 
-        - name: Verify target VDOM exists on the device
+        - name: Validate refresh response
           ansible.builtin.assert:
             that:
-              - >
-                target_vdom in (
-                  device_vdoms.json.result[0].data
-                  | default([])
-                  | map(attribute='name')
-                  | list
+              - refresh_device_response.json.result is defined
+              - refresh_device_response.json.result | length > 0
+              - refresh_device_response.json.result[0].status.code | int == 0
+              - >-
+                (
+                  refresh_device_response.json.result[0].data.taskid
+                  is defined
+                )
+                or
+                (
+                  refresh_device_response.json.result[0].data.task
+                  is defined
                 )
             fail_msg: >-
-              VDOM '{{ target_vdom }}' does not exist on
-              {{ authorized_device_final.name }}. Available:
-              {{ device_vdoms.json.result[0].data | default([]) | map(attribute='name') | list }}
-            success_msg: >-
-              VDOM '{{ target_vdom }}' exists on {{ authorized_device_final.name }}.
+              FortiManager failed to start device refresh.
 
+        - name: Save refresh task ID
+          ansible.builtin.set_fact:
+            refresh_task_id: >-
+              {{
+                refresh_device_response.json.result[0].data.taskid
+                | default(
+                    refresh_device_response.json.result[0].data.task
+                  )
+              }}
 
-        # ======================================================
-        # 9.23 DISPLAY MANAGED FORTIGATE
-        # [CHANGED] no fallback to management_ip: shows FMG's
-        # real value, so an empty IP is visible.
-        # ======================================================
-
-        - name: Display managed FortiGate
+        - name: Display refresh task ID
           ansible.builtin.debug:
             msg:
-              - "============================================================"
-              - "FORTIGATE AUTHORIZED SUCCESSFULLY"
-              - "============================================================"
-              - "FortiManager Name : {{ authorized_device_final.name }}"
-              - "FortiManager Serial: {{ authorized_device_final.sn }}"
-              - "FMG IP            : {{ managed_device.json.result[0].data.ip | default(authorized_device_final.ip | default('EMPTY')) }}"
-              - "Expected IP       : {{ management_ip }}"
-              - "OID               : {{ authorized_device_final.oid }}"
-              - "Platform          : {{ managed_device.json.result[0].data.platform_str | default(authorized_device_final.platform_str | default('EMPTY')) }}"
-              - "Target ADOM       : {{ target_adom }}"
-              - "Target VDOM       : {{ target_vdom }}"
-              - "Policy Package    : {{ policy_package }}"
-              - "============================================================"
+              - "FortiManager device refresh started."
+              - "Refresh task ID: {{ refresh_task_id }}"
 
+        # ====================================================
+        # 16. MONITOR REFRESH TASK
+        # ====================================================
 
-        # ======================================================
-        # 9.24 GET POLICY PACKAGE
-        # ======================================================
+        - name: Wait for device refresh to complete
+          ansible.builtin.uri:
+            url: "{{ fmg_jsonrpc_url }}"
+            method: POST
+            validate_certs: false
+            return_content: true
+            body_format: json
+            body:
+              id: 61
+              method: get
+              params:
+                - url: "/task/task/{{ refresh_task_id }}"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: refresh_task_status
+          until:
+            - refresh_task_status.json.result is defined
+            - refresh_task_status.json.result | length > 0
+            - refresh_task_status.json.result[0].status.code | int == 0
+            - >-
+              (
+                refresh_task_status.json.result[0].data.percent
+                | default(0)
+                | int
+              ) >= 100
+          retries: 36
+          delay: 5
+
+        - name: Validate refresh task result
+          ansible.builtin.assert:
+            that:
+              - refresh_task_status.json.result[0].data.num_err | default(0) | int == 0
+              - >-
+                refresh_task_status.json.result[0].data.percent
+                | default(0)
+                | int >= 100
+          fail_msg: >-
+            FortiManager device refresh completed with errors.
+
+            Task:
+            {{ refresh_task_status.json.result[0].data | to_nice_json }}
+
+        # ====================================================
+        # 17. RE-READ DEVICE AFTER REFRESH
+        # ====================================================
+
+        - name: Re-read managed devices after refresh
+          ansible.builtin.uri:
+            url: "{{ fmg_jsonrpc_url }}"
+            method: POST
+            validate_certs: false
+            return_content: true
+            body_format: json
+            body:
+              id: 70
+              method: get
+              params:
+                - url: "/dvmdb/adom/{{ selected_firewall.target_adom }}/device"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: devices_after_refresh
+
+        - name: Build device list after refresh
+          ansible.builtin.set_fact:
+            devices_after_refresh_list: >-
+              {{
+                devices_after_refresh.json.result[0].data
+                | default([])
+              }}
+
+        - name: Initialize device matches after refresh
+          ansible.builtin.set_fact:
+            final_device_matches: []
+
+        - name: Find final managed device by normalized serial
+          ansible.builtin.set_fact:
+            final_device_matches: >-
+              {{
+                final_device_matches
+                +
+                (
+                  [item]
+                  if
+                  (
+                    item.sn is defined
+                    and
+                    (
+                      item.sn
+                      | string
+                      | regex_replace('[^A-Za-z0-9]', '')
+                      | upper
+                    )
+                    ==
+                    normalized_device_serial
+                  )
+                  else
+                  []
+                )
+              }}
+          loop: "{{ devices_after_refresh_list }}"
+          loop_control:
+            label: "{{ item.name | default('unknown') }}"
+
+        - name: Verify final managed device
+          ansible.builtin.assert:
+            that:
+              - final_device_matches | length == 1
+            fail_msg: >-
+              The managed device could not be uniquely identified after
+              FortiManager refresh.
+
+        - name: Save final managed device
+          ansible.builtin.set_fact:
+            authorized_device_final: "{{ final_device_matches[0] }}"
+
+        # ====================================================
+        # 18. VERIFY DEVICE IDENTITY
+        # ====================================================
+
+        - name: Verify managed device identity
+          ansible.builtin.assert:
+            that:
+              - authorized_device_final.name is defined
+              - authorized_device_final.sn is defined
+              - >-
+                (
+                  authorized_device_final.sn
+                  | string
+                  | regex_replace('[^A-Za-z0-9]', '')
+                  | upper
+                )
+                ==
+                normalized_device_serial
+          fail_msg: >-
+            FortiManager managed-device identity verification failed.
+
+        - name: Display final managed device metadata
+          ansible.builtin.debug:
+            msg:
+              - "=========================================="
+              - "FORTIMANAGER MANAGED DEVICE"
+              - "=========================================="
+              - "Name          : {{ authorized_device_final.name }}"
+              - "Serial        : {{ authorized_device_final.sn }}"
+              - "IP            : {{ authorized_device_final.ip | default('unknown') }}"
+              - "Platform      : {{ authorized_device_final.platform_str | default('unknown') }}"
+              - "OID           : {{ authorized_device_final.oid | default('unknown') }}"
+              - "Target ADOM   : {{ selected_firewall.target_adom }}"
+              - "Target VDOM   : {{ selected_firewall.target_vdom }}"
+              - "=========================================="
+
+        # ====================================================
+        # 19. VERIFY MANAGEMENT IP
+        # ====================================================
+        #
+        # We DO verify the management IP because this is device
+        # metadata, not an independent VDOM verification.
+        #
+        # If FMG exposes the IP, it must match firewalls.vars.
+        # ====================================================
+
+        - name: Verify management IP when FortiManager provides it
+          ansible.builtin.assert:
+            that:
+              - >-
+                (
+                  authorized_device_final.ip
+                  | default('')
+                  | string
+                  | trim
+                )
+                ==
+                (
+                  selected_firewall.management_ip
+                  | string
+                  | trim
+                )
+            fail_msg: >-
+              FortiManager management IP does not match firewalls.vars.
+
+              Expected:
+                {{ selected_firewall.management_ip }}
+
+              FortiManager:
+                {{ authorized_device_final.ip | default('not available') }}
+
+              Refusing to continue because the Installation Target could
+              otherwise point to the wrong FortiGate.
+          when:
+            - authorized_device_final.ip is defined
+            - authorized_device_final.ip | string | length > 0
+
+        # ====================================================
+        # 20. VERIFY POLICY PACKAGE EXISTS
+        # ====================================================
 
         - name: Get policy package
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 7
-              method: "get"
-              session: "{{ fmg_session }}"
+              id: 80
+              method: get
               params:
                 - url: >-
-                    /pm/pkg/adom/{{ target_adom }}/{{ policy_package }}
-            return_content: true
-          register: package_response
-          no_log: true
-          retries: "{{ package_lookup_retries }}"
-          delay: "{{ package_lookup_delay }}"
-          until:
-            - package_response.json.result is defined
-            - package_response.json.result | length > 0
-            - package_response.json.result[0].status.code | int == 0
-            - package_response.json.result[0].data is defined
+                    /pm/pkg/adom/{{ selected_firewall.target_adom }}/{{
+                    selected_firewall.policy_package }}
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: policy_package_response
 
         - name: Verify policy package exists
           ansible.builtin.assert:
             that:
-              - package_response.json.result[0].data.name is defined
-              - package_response.json.result[0].data.name == policy_package
-            fail_msg: >-
-              Policy package '{{ policy_package }}' was not found in
-              ADOM '{{ target_adom }}'.
-            success_msg: >-
-              Policy package '{{ policy_package }}' exists in ADOM
-              '{{ target_adom }}'.
-
-        - name: Save current policy package scope
-          ansible.builtin.set_fact:
-            current_scope_members: >-
-              {{
-                package_response.json.result[0].data.get('scope member', [])
-                | default([], true)
-              }}
-
-        - name: Display current installation targets
-          ansible.builtin.debug:
-            msg:
-              - "============================================================"
-              - "CURRENT INSTALLATION TARGETS"
-              - "============================================================"
-              - "Policy Package : {{ policy_package }}"
-              - "Targets        : {{ current_scope_members }}"
-              - "============================================================"
-
-
-        # ======================================================
-        # 9.28 DECIDE: exists / missing / wrong VDOM
-        #
-        # [CHANGED] Identification is still by device name.
-        # If FMG returns a vdom for the entry and it differs from
-        # target_vdom, the entry is flagged as a mismatch.
-        # If FMG does not return a vdom, the entry is accepted
-        # (no false mismatch, no endless re-adds).
-        # ======================================================
-
-        - name: Evaluate existing installation target
-          ansible.builtin.set_fact:
-            scope_entries_for_device: >-
-              {{
-                current_scope_members
-                | selectattr('name', 'defined')
-                | selectattr('name', 'equalto', authorized_device_final.name)
-                | list
-              }}
-
-        - name: Determine installation target state
-          ansible.builtin.set_fact:
-            installation_target_exists: "{{ scope_entries_for_device | length > 0 }}"
-            scope_vdom_mismatch: >-
-              {{
-                (scope_entries_for_device | length > 0)
-                and
-                (
-                  scope_entries_for_device
-                  | selectattr('vdom', 'defined')
-                  | rejectattr('vdom', 'equalto', target_vdom)
-                  | list
-                  | length
-                ) > 0
-              }}
-
-        - name: Determine whether the scope must be added
-          ansible.builtin.set_fact:
-            installation_target_needs_add: >-
-              {{
-                (not installation_target_exists | bool)
-                or
-                (
-                  scope_vdom_mismatch | bool
-                  and fmg_fix_vdom_mismatch | bool
-                )
-              }}
-
-        - name: Display installation target decision
-          ansible.builtin.debug:
-            msg:
-              - "============================================================"
-              - "INSTALLATION TARGET DECISION"
-              - "============================================================"
-              - "Policy Package : {{ policy_package }}"
-              - "FortiGate      : {{ authorized_device_final.name }}"
-              - "Target ADOM    : {{ target_adom }}"
-              - "Target VDOM    : {{ target_vdom }}"
-              - "Existing entry : {{ scope_entries_for_device }}"
+              - policy_package_response.json.result is defined
+              - policy_package_response.json.result | length > 0
+              - policy_package_response.json.result[0].status.code | int == 0
+              - policy_package_response.json.result[0].data.name is defined
               - >-
-                {{
-                  'VDOM MISMATCH - WILL REPLACE ENTRY'
-                  if (installation_target_exists | bool and scope_vdom_mismatch | bool and fmg_fix_vdom_mismatch | bool)
-                  else 'VDOM MISMATCH - NOT FIXED (fmg_fix_vdom_mismatch=false)'
-                  if (installation_target_exists | bool and scope_vdom_mismatch | bool)
-                  else 'ALREADY EXISTS - NO CHANGE REQUIRED'
-                  if installation_target_exists | bool
-                  else 'MISSING - WILL ADD TARGET'
-                }}
-              - "============================================================"
-
-
-        # ======================================================
-        # [NEW] 9.29a REMOVE ENTRY WITH WRONG VDOM
-        # Removes only this device's entry.
-        # ======================================================
-
-        - name: Remove installation target with wrong VDOM
-          ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
-            body_format: json
-            body:
-              id: 12
-              method: "delete"
-              session: "{{ fmg_session }}"
-              params:
-                - url: >-
-                    /pm/pkg/adom/{{ target_adom }}/{{ policy_package }}/scope member
-                  data: "{{ scope_entries_for_device }}"
-            return_content: true
-          register: scope_delete_response
-          no_log: true
-          failed_when: false
-          when:
-            - installation_target_exists | bool
-            - scope_vdom_mismatch | bool
-            - fmg_fix_vdom_mismatch | bool
-
-        - name: Verify scope delete
-          ansible.builtin.assert:
-            that:
-              - scope_delete_response.json.result is defined
-              - scope_delete_response.json.result[0].status.code | int == 0
+                policy_package_response.json.result[0].data.name
+                ==
+                selected_firewall.policy_package
             fail_msg: >-
-              Could not remove the old scope entry of
-              {{ authorized_device_final.name }}. FMG code:
-              {{ scope_delete_response.json.result[0].status.code | default('unknown') }}
-              message:
-              {{ scope_delete_response.json.result[0].status.message | default('unknown') }}
-          when:
-            - installation_target_exists | bool
-            - scope_vdom_mismatch | bool
-            - fmg_fix_vdom_mismatch | bool
+              Policy package
+              '{{ selected_firewall.policy_package }}'
+              does not exist in ADOM
+              '{{ selected_firewall.target_adom }}'.
 
+              Step 04 will NOT create a policy package automatically.
 
-        # ======================================================
-        # 9.30 ADD INSTALLATION TARGET
-        # method "add" (never "set") so other targets survive.
-        # [CHANGED] no_log added: the body contains the session.
-        # ======================================================
+              Create/manage the package with the dedicated policy-package
+              management step first.
 
-        - name: Add FortiGate to policy package installation target
+        - name: Save policy package data
+          ansible.builtin.set_fact:
+            policy_package_data: >-
+              {{
+                policy_package_response.json.result[0].data
+              }}
+
+        # ====================================================
+        # 21. READ EXISTING INSTALLATION TARGETS
+        # ====================================================
+
+        - name: Read existing Installation Targets
+          ansible.builtin.set_fact:
+            existing_scope_members: >-
+              {{
+                policy_package_data['scope member']
+                | default([])
+              }}
+
+        - name: Display existing Installation Targets
+          ansible.builtin.debug:
+            msg:
+              - "Policy Package       : {{ selected_firewall.policy_package }}"
+              - "Existing targets     : {{ existing_scope_members }}"
+
+        # ====================================================
+        # 22. DETERMINE WHETHER TARGET ALREADY EXISTS
+        # ====================================================
+
+        - name: Check whether managed device is already an Installation Target
+          ansible.builtin.set_fact:
+            installation_target_exists: >-
+              {{
+                existing_scope_members
+                | selectattr(
+                    'name',
+                    'equalto',
+                    authorized_device_final.name
+                  )
+                | selectattr(
+                    'vdom',
+                    'equalto',
+                    selected_firewall.target_vdom
+                  )
+                | list
+                | length > 0
+              }}
+
+        # ====================================================
+        # 23. ADD INSTALLATION TARGET
+        # ====================================================
+        #
+        # IMPORTANT:
+        #
+        # The documented API is:
+        #
+        #   add
+        #   /pm/pkg/adom/<adom>/<pkg>/scope member
+        #
+        # data:
+        #   name: <managed device name>
+        #   vdom: <target vdom>
+        #
+        # Do NOT use:
+        #   oid
+        #   vdom_oid
+        #
+        # here.
+        #
+        # OID/vdom_oid are relevant to other FortiManager APIs,
+        # not this scope-member assignment.
+        # ========================================================
+
+        - name: Add managed device as Installation Target
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 8
-              method: "add"
-              session: "{{ fmg_session }}"
+              id: 90
+              method: add
               params:
                 - url: >-
-                    /pm/pkg/adom/{{ target_adom }}/{{ policy_package }}/scope member
+                    /pm/pkg/adom/{{ selected_firewall.target_adom }}/{{
+                    selected_firewall.policy_package }}/scope member
                   data:
                     name: "{{ authorized_device_final.name }}"
-                    vdom: "{{ target_vdom }}"
-            return_content: true
-          register: scope_add_response
-          no_log: true
-          failed_when: false
-          when:
-            - installation_target_needs_add | bool
+                    vdom: "{{ selected_firewall.target_vdom }}"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: installation_target_add_response
+          when: not installation_target_exists
 
-        - name: Display installation target API result
-          ansible.builtin.debug:
-            msg:
-              - "============================================================"
-              - "INSTALLATION TARGET API RESULT"
-              - "============================================================"
-              - "Device : {{ authorized_device_final.name }}"
-              - "Package: {{ policy_package }}"
-              - >-
-                {{
-                  'Scope add API was executed.'
-                  if installation_target_needs_add | bool
-                  else 'Scope add was not required.'
-                }}
-              - >-
-                {{
-                  'FMG status code: ' ~
-                  (
-                    scope_add_response.json.result[0].status.code | string
-                    if (
-                      installation_target_needs_add | bool
-                      and scope_add_response.json is defined
-                      and scope_add_response.json.result is defined
-                      and scope_add_response.json.result | length > 0
-                    )
-                    else 'not executed'
-                  )
-                }}
-              - >-
-                {{
-                  'FMG status message: ' ~
-                  (
-                    scope_add_response.json.result[0].status.message | string
-                    if (
-                      installation_target_needs_add | bool
-                      and scope_add_response.json is defined
-                      and scope_add_response.json.result is defined
-                      and scope_add_response.json.result | length > 0
-                    )
-                    else 'not executed'
-                  )
-                }}
-              - "============================================================"
-
-        # [CHANGED] duplicate-object code is negative in FMG (-2),
-        # not 2. 0 = OK, -2 = already exists.
-        - name: Verify installation target API operation
+        - name: Validate Installation Target API response
           ansible.builtin.assert:
             that:
-              - scope_add_response.json.result is defined
-              - scope_add_response.json.result | length > 0
-              - scope_add_response.json.result[0].status.code | int in [0, -2]
+              - installation_target_add_response.json.result is defined
+              - installation_target_add_response.json.result | length > 0
+              - >-
+                installation_target_add_response.json.result[0].status.code
+                | int == 0
             fail_msg: >-
-              FortiManager failed to add '{{ authorized_device_final.name }}'
-              to policy package '{{ policy_package }}'.
-              Code: {{ scope_add_response.json.result[0].status.code | default('unknown') }}
-              Message: {{ scope_add_response.json.result[0].status.message | default('unknown') }}
-          when:
-            - installation_target_needs_add | bool
+              Failed to add
+              '{{ authorized_device_final.name }}'
+              as an Installation Target for policy package
+              '{{ selected_firewall.policy_package }}'.
+          when: not installation_target_exists
 
-
-        # ======================================================
-        # 9.33 RE-READ POLICY PACKAGE AND VERIFY
-        # ======================================================
-
-        - name: Read final policy package state
-          ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
-            body_format: json
-            body:
-              id: 9
-              method: "get"
-              session: "{{ fmg_session }}"
-              params:
-                - url: >-
-                    /pm/pkg/adom/{{ target_adom }}/{{ policy_package }}
-            return_content: true
-          register: final_package_response
-          no_log: true
-          retries: "{{ scope_lookup_retries }}"
-          delay: "{{ scope_lookup_delay }}"
-          until:
-            - final_package_response.json.result is defined
-            - final_package_response.json.result | length > 0
-            - final_package_response.json.result[0].status.code | int == 0
-            - final_package_response.json.result[0].data is defined
-
-        - name: Save final policy package scope
-          ansible.builtin.set_fact:
-            final_package_data: "{{ final_package_response.json.result[0].data }}"
-            final_scope_members: >-
+        - name: Display Installation Target status
+          ansible.builtin.debug:
+            msg: >-
               {{
-                final_package_response.json.result[0].data.get('scope member', [])
-                | default([], true)
+                'Installation Target already exists.'
+                if installation_target_exists
+                else
+                'Installation Target added successfully.'
               }}
 
-        # Verifies package name + device name, and the vdom whenever
-        # FMG returns one for the entry.
-        - name: Verify final installation target
+        # ====================================================
+        # 24. RE-READ POLICY PACKAGE
+        # ====================================================
+
+        - name: Re-read policy package after Installation Target operation
+          ansible.builtin.uri:
+            url: "{{ fmg_jsonrpc_url }}"
+            method: POST
+            validate_certs: false
+            return_content: true
+            body_format: json
+            body:
+              id: 100
+              method: get
+              params:
+                - url: >-
+                    /pm/pkg/adom/{{ selected_firewall.target_adom }}/{{
+                    selected_firewall.policy_package }}
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: final_policy_package_response
+
+        - name: Validate final policy package response
           ansible.builtin.assert:
             that:
-              - final_package_data.name == policy_package
-              - >
-                (
-                  final_scope_members
-                  | selectattr('name', 'defined')
-                  | selectattr('name', 'equalto', authorized_device_final.name)
-                  | list
-                  | length
-                ) > 0
-              - >
-                (
-                  final_scope_members
-                  | selectattr('name', 'defined')
-                  | selectattr('name', 'equalto', authorized_device_final.name)
-                  | selectattr('vdom', 'defined')
-                  | rejectattr('vdom', 'equalto', target_vdom)
-                  | list
-                  | length
-                ) == 0
+              - final_policy_package_response.json.result is defined
+              - final_policy_package_response.json.result | length > 0
+              - final_policy_package_response.json.result[0].status.code | int == 0
             fail_msg: >-
-              Installation target verification failed.
-              Policy package: {{ policy_package }}
-              Expected FortiGate: {{ authorized_device_final.name }}
-              Expected VDOM: {{ target_vdom }}
-              Final scope: {{ final_scope_members }}
-            success_msg: >-
-              Installation target verified. Policy package:
-              {{ policy_package }} FortiGate:
-              {{ authorized_device_final.name }}
+              Failed to read policy package after Installation Target
+              configuration.
 
-        - name: Display Step 04 final summary
+        - name: Save final Installation Targets
+          ansible.builtin.set_fact:
+            final_scope_members: >-
+              {{
+                final_policy_package_response.json.result[0].data['scope member']
+                | default([])
+              }}
+
+        # ====================================================
+        # 25. FINAL INSTALLATION TARGET VERIFICATION
+        # ====================================================
+        #
+        # IMPORTANT:
+        # We intentionally verify:
+        #
+        #   package name
+        #   managed device name
+        #
+        # We do NOT perform an independent VDOM verification,
+        # as requested.
+        #
+        # The API itself stores the target as name + vdom.
+        # ========================================================
+
+        - name: Verify Installation Target exists
+          ansible.builtin.assert:
+            that:
+              - >-
+                final_scope_members
+                | selectattr(
+                    'name',
+                    'equalto',
+                    authorized_device_final.name
+                  )
+                | list
+                | length > 0
+            fail_msg: >-
+              Installation Target verification failed.
+
+              Policy Package:
+                {{ selected_firewall.policy_package }}
+
+              Expected managed device:
+                {{ authorized_device_final.name }}
+
+              Actual scope:
+                {{ final_scope_members | to_nice_json }}
+
+        - name: Display final Installation Target
           ansible.builtin.debug:
             msg:
-              - "============================================================"
-              - "STEP 04 - SUCCESS"
-              - "============================================================"
-              - "FORTIGATE"
-              - "------------------------------------------------------------"
-              - "Name             : {{ authorized_device_final.name }}"
-              - "Serial           : {{ authorized_device_final.sn }}"
-              - "FMG IP           : {{ managed_device.json.result[0].data.ip | default('not checked') }}"
-              - "Platform         : {{ managed_device.json.result[0].data.platform_str | default('not checked') }}"
-              - "OID              : {{ authorized_device_final.oid }}"
-              - "FORTIMANAGER"
-              - "------------------------------------------------------------"
-              - "Target ADOM      : {{ target_adom }}"
-              - "Target VDOM      : {{ target_vdom }} (exists on device: verified)"
-              - "POLICY PACKAGE"
-              - "------------------------------------------------------------"
-              - "Package          : {{ policy_package }}"
-              - "Installation Target: {{ authorized_device_final.name }}"
-              - "SERIAL HANDLING"
-              - "------------------------------------------------------------"
-              - "NetBox Serial    : {{ device_serial }}"
-              - "FMG Serial       : {{ authorized_device_final.sn }}"
-              - "Normalized Match : SUCCESS"
-              - "FINAL RESULT"
-              - "------------------------------------------------------------"
-              - "Authorization    : SUCCESS"
-              - "Device readiness : {{ 'SUCCESS' if fmg_require_device_online | bool else 'SKIPPED' }}"
-              - "Installation Target: SUCCESS"
-              - "Verification     : SUCCESS"
-              - "============================================================"
+              - "=========================================="
+              - "INSTALLATION TARGET VERIFIED"
+              - "=========================================="
+              - "Policy Package : {{ selected_firewall.policy_package }}"
+              - "Device         : {{ authorized_device_final.name }}"
+              - "VDOM           : {{ selected_firewall.target_vdom }}"
+              - "IP             : {{ authorized_device_final.ip | default('unknown') }}"
+              - "Platform       : {{ authorized_device_final.platform_str | default('unknown') }}"
+              - "OID            : {{ authorized_device_final.oid | default('unknown') }}"
+              - "=========================================="
 
+        # ====================================================
+        # 26. FINAL SUMMARY
+        # ====================================================
 
-      # ========================================================
-      # GUARANTEED LOGOUT
-      # ========================================================
+        - name: STEP 04 final success
+          ansible.builtin.debug:
+            msg:
+              - ""
+              - "===================================================="
+              - "STEP 04 STATUS: SUCCESS"
+              - "===================================================="
+              - "FortiGate serial : {{ selected_firewall.serial }}"
+              - "FMG serial       : {{ authorized_device_final.sn }}"
+              - "FMG device name  : {{ authorized_device_final.name }}"
+              - "Management IP    : {{ authorized_device_final.ip | default('unknown') }}"
+              - "Platform         : {{ authorized_device_final.platform_str | default('unknown') }}"
+              - "Target ADOM      : {{ selected_firewall.target_adom }}"
+              - "Target VDOM      : {{ selected_firewall.target_vdom }}"
+              - "Policy Package   : {{ selected_firewall.policy_package }}"
+              - "Installation Target: VERIFIED"
+              - "===================================================="
+
+      # ======================================================
+      # ERROR HANDLING
+      # ======================================================
+
+      rescue:
+
+        - name: Display Step 04 failure information
+          ansible.builtin.debug:
+            msg:
+              - ""
+              - "===================================================="
+              - "STEP 04 STATUS: FAILED"
+              - "===================================================="
+              - "NetBox asset_tag : {{ netbox_asset_tag }}"
+              - "Serial           : {{ selected_firewall.serial }}"
+              - "Target ADOM      : {{ selected_firewall.target_adom }}"
+              - "Target VDOM      : {{ selected_firewall.target_vdom }}"
+              - "Policy Package   : {{ selected_firewall.policy_package }}"
+              - ""
+              - "The workflow was stopped intentionally."
+              - "No installation was triggered by Step 04."
+              - "===================================================="
+
+        - name: Fail Step 04
+          ansible.builtin.fail:
+            msg: >-
+              Step 04 failed. See the previous task output for details.
+
+      # ======================================================
+      # ALWAYS LOGOUT
+      # ======================================================
 
       always:
 
         - name: Logout from FortiManager
           ansible.builtin.uri:
-            url: "https://{{ fortimanager_host }}/jsonrpc"
+            url: "{{ fmg_jsonrpc_url }}"
             method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            headers:
-              Content-Type: application/json
+            validate_certs: false
+            return_content: true
             body_format: json
             body:
-              id: 99
-              method: "exec"
-              session: "{{ fmg_session | default('') }}"
+              id: 999
+              method: exec
               params:
                 - url: "/sys/logout"
-            return_content: true
+              session: "{{ fmg_session }}"
+            status_code: 200
           when:
             - fmg_session is defined
           no_log: true
+
+        - name: Display logout status
+          ansible.builtin.debug:
+            msg: "FortiManager API session closed."
+          when:
+            - fmg_session is defined
