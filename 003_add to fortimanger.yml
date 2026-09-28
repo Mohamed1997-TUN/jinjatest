@@ -240,15 +240,15 @@
         - central_management_get.status | default(0) | int == 200
         - central_management_get.json is defined
         - >
-          central_management_get.json.response.status | default('') != 'success'
+          central_management_get.json.status | default('') != 'success'
           or
-          central_management_get.json.response.results.type | default('none')
+          central_management_get.json.results.type | default('none')
           != 'fortimanager'
           or
-          central_management_get.json.response.results.fmg | default('')
+          central_management_get.json.results.fmg | default('')
           != '"' ~ fortimanager_host ~ '"'
           or
-          central_management_get.json.response.results['serial-number']
+          central_management_get.json.results['serial-number']
           | default('')
           != '"' ~ fortimanager_serial ~ '"'
 
@@ -294,23 +294,24 @@
           - "Management IP  : {{ selected_firewall.management_ip }}"
           - "FortiManager   : {{ fortimanager_host }}"
           - "FMG Serial     : {{ fortimanager_serial }}"
+          - "HTTP Status    : {{ central_management_verify.status | default('N/A') }}"
           - >-
             {{
               'CONFIGURED'
               if (
                 central_management_verify.status | default(0) | int == 200
                 and
-                central_management_verify.json.response.status
+                central_management_verify.json.status
                 | default('') == 'success'
                 and
-                central_management_verify.json.response.results.type
+                central_management_verify.json.results.type
                 | default('none') == 'fortimanager'
                 and
-                central_management_verify.json.response.results.fmg
+                central_management_verify.json.results.fmg
                 | default('')
                 == '"' ~ fortimanager_host ~ '"'
                 and
-                central_management_verify.json.response.results['serial-number']
+                central_management_verify.json.results['serial-number']
                 | default('')
                 == '"' ~ fortimanager_serial ~ '"'
               )
@@ -330,11 +331,11 @@
         that:
           - central_management_verify.status | default(0) | int == 200
           - central_management_verify.json is defined
-          - central_management_verify.json.response.status | default('') == 'success'
-          - central_management_verify.json.response.results.type | default('none') == 'fortimanager'
-          - central_management_verify.json.response.results.fmg | default('')
+          - central_management_verify.json.status | default('') == 'success'
+          - central_management_verify.json.results.type | default('none') == 'fortimanager'
+          - central_management_verify.json.results.fmg | default('')
             == '"' ~ fortimanager_host ~ '"'
-          - central_management_verify.json.response.results['serial-number'] | default('')
+          - central_management_verify.json.results['serial-number'] | default('')
             == '"' ~ fortimanager_serial ~ '"'
         fail_msg: >-
           Central Management verification failed for
