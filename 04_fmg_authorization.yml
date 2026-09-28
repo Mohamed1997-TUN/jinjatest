@@ -86,7 +86,7 @@
           - selected_firewall.target_adom is defined
           - selected_firewall.target_vdom is defined
           - selected_firewall.policy_package is defined
-          - selected_firewall.policy_package | length > 0
+          - selected_firewall.policy_package | string | length > 0
 
         fail_msg: >-
           Firewall {{ asset_tag }}
@@ -756,22 +756,21 @@
 
 
         # ========================================================
-        # 8.22 POLICY PACKAGE INSTALLATION TARGET
+        # 8.22 ENSURE POLICY PACKAGE INSTALLATION TARGET
         # ========================================================
         #
-        # Authorization and package-target management are intentionally
-        # handled in the same provisioning step.
+        # IMPORTANT:
+        # FortiManager represents a package Installation Target
+        # through the package "scope member" table.
         #
-        # The source of truth is firewalls.vars:
-        #   target_adom
-        #   target_vdom
-        #   policy_package
+        # The FortiManager API expects the scope-member data as a LIST:
         #
-        # The FortiManager device name comes from the authorized device.
+        #   data:
+        #     - name: "<device>"
+        #       vdom: "<vdom>"
         #
-        # We DO NOT modify policy package content here.
-        # We only ensure that the FortiGate is assigned as an
-        # Installation Target for the configured policy package.
+        # This is deliberately handled here, immediately after
+        # authorization, so Step 06 can install the package later.
         # ========================================================
 
         - name: Get target policy package
@@ -780,17 +779,14 @@
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
-
             headers:
               Content-Type: application/json
-
             body_format: json
 
             body:
               id: 8
               method: "get"
               session: "{{ fmg_session }}"
-
               params:
                 - url: "/pm/pkg/adom/{{ target_adom }}/{{ policy_package }}"
 
@@ -800,50 +796,54 @@
 
           failed_when:
             - target_policy_package.status != 200
-            - >
-              target_policy_package.json.result is not defined
-              or target_policy_package.json.result | length == 0
-            - >
-              target_policy_package.json.result[0].status.code
-              | default(-1)
-              | int != 0
+            - target_policy_package.json.result is not defined
+            - target_policy_package.json.result | length == 0
+            - target_policy_package.json.result[0].status.code | int != 0
+
+
+        - name: Display target policy package state
+          ansible.builtin.debug:
+            msg:
+              - "=============================================================="
+              - "POLICY PACKAGE STATE"
+              - "=============================================================="
+              - "ADOM            : {{ target_adom }}"
+              - "Policy package  : {{ policy_package }}"
+              - "FortiGate        : {{ authorized_device.name }}"
+              - "VDOM            : {{ target_vdom }}"
+              - >-
+                Current scope member:
+                {{
+                  target_policy_package.json.result[0].data['scope member']
+                  | default([])
+                }}
+              - "=============================================================="
 
 
         - name: Verify target policy package exists
           ansible.builtin.assert:
             that:
-              - target_policy_package.json.result is defined
-              - target_policy_package.json.result | length > 0
-              - target_policy_package.json.result[0].status.code | int == 0
               - target_policy_package.json.result[0].data is defined
-              - target_policy_package.json.result[0].data.name is defined
+              - target_policy_package.json.result[0].data.name == policy_package
 
             fail_msg: >-
               Policy package '{{ policy_package }}' was not found
               in ADOM '{{ target_adom }}'.
 
-              Create/manage the package in the policy-package
-              management step before continuing.
+              The authorization step cannot create an Installation Target
+              for a package that does not exist.
 
             success_msg: >-
               Policy package '{{ policy_package }}' exists in
               ADOM '{{ target_adom }}'.
 
 
-        - name: Save current policy package data
-          ansible.builtin.set_fact:
-            current_policy_package: >-
-              {{
-                target_policy_package.json.result[0].data
-              }}
-
-
-        - name: Check whether FortiGate is already an installation target
+        - name: Determine whether Installation Target already exists
           ansible.builtin.set_fact:
             installation_target_exists: >-
               {{
                 (
-                  current_policy_package['scope member']
+                  target_policy_package.json.result[0].data['scope member']
                   | default([])
                   | selectattr('name', 'defined')
                   | selectattr('vdom', 'defined')
@@ -855,31 +855,34 @@
               }}
 
 
-        - name: Display installation target state
+        - name: Display Installation Target decision
           ansible.builtin.debug:
             msg:
               - "=============================================================="
-              - "POLICY PACKAGE INSTALLATION TARGET"
+              - "INSTALLATION TARGET DECISION"
               - "=============================================================="
-              - "ADOM            : {{ target_adom }}"
-              - "Policy package   : {{ policy_package }}"
+              - "Policy package  : {{ policy_package }}"
               - "FortiGate        : {{ authorized_device.name }}"
-              - "Serial           : {{ authorized_device.sn }}"
-              - "Target VDOM      : {{ target_vdom }}"
-              - "Target exists    : {{ installation_target_exists }}"
+              - "VDOM            : {{ target_vdom }}"
+              - "Already exists  : {{ installation_target_exists }}"
+              - >-
+                Action:
+                {{
+                  'SKIP - target already exists'
+                  if installation_target_exists
+                  else 'ADD - target is missing'
+                }}
               - "=============================================================="
 
 
-        - name: Add FortiGate to policy package installation targets
+        - name: Add FortiGate to policy package Installation Targets
           ansible.builtin.uri:
             delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
-
             headers:
               Content-Type: application/json
-
             body_format: json
 
             body:
@@ -889,10 +892,9 @@
 
               params:
                 - url: "/pm/pkg/adom/{{ target_adom }}/{{ policy_package }}/scope member"
-
                   data:
-                    name: "{{ authorized_device.name }}"
-                    vdom: "{{ target_vdom }}"
+                    - name: "{{ authorized_device.name }}"
+                      vdom: "{{ target_vdom }}"
 
             return_content: true
 
@@ -903,58 +905,46 @@
 
           failed_when:
             - add_installation_target.status != 200
-            - >
-              add_installation_target.json.result is not defined
-              or add_installation_target.json.result | length == 0
-            - >
-              add_installation_target.json.result[0].status.code
-              | default(-1)
-              | int != 0
+            - add_installation_target.json.result is not defined
+            - add_installation_target.json.result | length == 0
+            - add_installation_target.json.result[0].status.code | int != 0
 
 
-        - name: Verify installation target add request
-          ansible.builtin.assert:
-            that:
-              - add_installation_target.json.result is defined
-              - add_installation_target.json.result | length > 0
-              - add_installation_target.json.result[0].status.code | int == 0
-
-            fail_msg: >-
-              FortiManager failed to add
-              '{{ authorized_device.name }}/{{ target_vdom }}'
-              to installation targets of policy package
-              '{{ policy_package }}'.
-
-              Code:
-              {{
-                add_installation_target.json.result[0].status.code
-                | default('N/A')
-              }}
-
-              Message:
-              {{
-                add_installation_target.json.result[0].status.message
-                | default('N/A')
-              }}
-
-            success_msg: >-
-              FortiGate '{{ authorized_device.name }}/{{ target_vdom }}'
-              was added to policy package '{{ policy_package }}'.
+        - name: Display Installation Target add response
+          ansible.builtin.debug:
+            msg:
+              - "=============================================================="
+              - "INSTALLATION TARGET API RESPONSE"
+              - "=============================================================="
+              - "FortiGate        : {{ authorized_device.name }}"
+              - "VDOM            : {{ target_vdom }}"
+              - "Policy package  : {{ policy_package }}"
+              - >-
+                Status code:
+                {{
+                  add_installation_target.json.result[0].status.code
+                  | default('SKIPPED')
+                }}
+              - >-
+                Status message:
+                {{
+                  add_installation_target.json.result[0].status.message
+                  | default('SKIPPED')
+                }}
+              - "=============================================================="
 
           when:
             - not installation_target_exists
 
 
-        - name: Re-read policy package after target update
+        - name: Re-read policy package after Installation Target update
           ansible.builtin.uri:
             delegate_to: localhost
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
             validate_certs: "{{ fmg_validate_certs }}"
-
             headers:
               Content-Type: application/json
-
             body_format: json
 
             body:
@@ -968,7 +958,8 @@
             return_content: true
 
           register: policy_package_after_target
-          retries: 6
+
+          retries: 10
           delay: 3
 
           until:
@@ -988,12 +979,10 @@
               ) > 0
 
 
-        - name: Verify FortiGate is an installation target
+        - name: Verify Installation Target exists in FortiManager
           ansible.builtin.assert:
             that:
-              - policy_package_after_target.json.result is defined
-              - policy_package_after_target.json.result | length > 0
-              - policy_package_after_target.json.result[0].status.code | int == 0
+              - policy_package_after_target.json.result[0].data is defined
               - >
                 (
                   policy_package_after_target.json.result[0].data['scope member']
@@ -1007,14 +996,15 @@
                 ) > 0
 
             fail_msg: >-
-              FortiGate '{{ authorized_device.name }}/{{ target_vdom }}'
-              is NOT present in the Installation Targets of
-              policy package '{{ policy_package }}'.
+              FortiGate '{{ authorized_device.name }}'
+              with VDOM '{{ target_vdom }}' is still not present
+              in the Installation Targets of policy package
+              '{{ policy_package }}'.
 
             success_msg: >-
               FortiGate '{{ authorized_device.name }}/{{ target_vdom }}'
-              is confirmed as an Installation Target of
-              policy package '{{ policy_package }}'.
+              is confirmed as an Installation Target of policy package
+              '{{ policy_package }}'.
 
 
         # ========================================================
@@ -1025,7 +1015,7 @@
           ansible.builtin.debug:
             msg:
               - "=================================================="
-              - "STEP 03 - FORTIGATE AUTHORIZATION"
+              - "STEP 03 - FORTIGATE AUTHORIZATION + PACKAGE TARGET"
               - "=================================================="
               - "NetBox Asset Tag : {{ asset_tag }}"
               - "FortiGate        : {{ authorized_device.name }}"
