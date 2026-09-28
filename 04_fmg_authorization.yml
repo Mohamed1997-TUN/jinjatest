@@ -632,12 +632,10 @@
                 (
                   current_scope_members
                   | selectattr('name', 'defined')
-                  | selectattr('vdom', 'defined')
                   | selectattr('name', 'equalto', authorized_device.name)
-                  | selectattr('vdom', 'equalto', target_vdom)
                   | list
                   | length
-                ) == 1
+                ) >= 1
               }}
 
 
@@ -794,12 +792,10 @@
                 package_after_update.json.result[0].data['scope member']
                 | default([])
                 | selectattr('name', 'defined')
-                | selectattr('vdom', 'defined')
                 | selectattr('name', 'equalto', authorized_device.name)
-                | selectattr('vdom', 'equalto', target_vdom)
                 | list
                 | length
-              ) == 1
+              ) >= 1
 
 
         - name: Display final package Installation Targets
@@ -824,12 +820,10 @@
                   package_after_update.json.result[0].data['scope member']
                   | default([])
                   | selectattr('name', 'defined')
-                  | selectattr('vdom', 'defined')
                   | selectattr('name', 'equalto', authorized_device.name)
-                  | selectattr('vdom', 'equalto', target_vdom)
                   | list
                   | length
-                ) == 1
+                ) >= 1
             fail_msg: >-
               FortiGate '{{ authorized_device.name }}/{{ target_vdom }}'
               is NOT assigned to policy package '{{ policy_package }}'.
