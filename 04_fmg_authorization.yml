@@ -736,36 +736,15 @@
 
 
         # ========================================================
-        # 8.25 GET TARGET VDOM OID FOR SCOPE OBJECT
+        # 8.25 READ POLICY PACKAGE
         # ========================================================
         #
-        # The VDOM is used only to build the FortiManager
-        # Installation Target object.
+        # Step 04 is responsible for ensuring that the selected
+        # FortiGate is an Installation Target of the selected package.
         #
-        # IMPORTANT:
-        # No VDOM verification/assertion is performed here.
-        # ========================================================
-
-        - name: Initialize target VDOM OID
-          ansible.builtin.set_fact:
-            target_vdom_oid: ""
-
-        - name: Find target VDOM OID
-          ansible.builtin.set_fact:
-            target_vdom_oid: "{{ item.oid }}"
-          loop: >-
-            {{
-              authorized_device_full.vdom
-              | default([])
-            }}
-          when:
-            - item.name is defined
-            - item.oid is defined
-            - item.name == target_vdom
-
-
-        # ========================================================
-        # 8.26 READ POLICY PACKAGE
+        # No VDOM verification is performed here.
+        # The target VDOM is taken directly from firewalls.vars and is
+        # sent to FortiManager as part of the scope-member operation.
         # ========================================================
 
         - name: Read policy package
@@ -788,7 +767,7 @@
 
 
         # ========================================================
-        # 8.27 VERIFY POLICY PACKAGE
+        # 8.26 VERIFY POLICY PACKAGE
         # ========================================================
 
         - name: Verify policy package exists
@@ -811,15 +790,11 @@
 
 
         # ========================================================
-        # 8.28 SAVE CURRENT PACKAGE SCOPE
+        # 8.27 SAVE CURRENT PACKAGE SCOPE
         # ========================================================
 
         - name: Save current package scope
           ansible.builtin.set_fact:
-            package_data: >-
-              {{
-                package_before_update.json.result[0].data
-              }}
             current_scope_members: >-
               {{
                 package_before_update.json.result[0].data.get(
@@ -830,7 +805,7 @@
 
 
         # ========================================================
-        # 8.29 DISPLAY CURRENT INSTALLATION TARGETS
+        # 8.28 DISPLAY CURRENT INSTALLATION TARGETS
         # ========================================================
 
         - name: Display current Installation Target scope
@@ -845,101 +820,78 @@
 
 
         # ========================================================
-        # 8.30 BUILD COMPLETE GUI-STYLE SCOPE MEMBER
+        # 8.29 DETERMINE WHETHER MAPPING IS REQUIRED
         # ========================================================
         #
-        # IMPORTANT:
+        # We deliberately check only the device name.
         #
-        # The GUI-style Installation Target contains:
+        # We do NOT verify VDOM here.
+        # We do NOT require oid/vdom_oid in the returned scope.
         #
-        #   name
-        #   oid
-        #   vdom
-        #   vdom_oid
+        # This matches the FortiManager API behavior already observed
+        # in this environment, where "scope member" can be returned as:
         #
-        # Previously we only supplied name/vdom. That produced the
-        # incomplete GUI entry with empty IP/platform.
+        #   { "name": "dhia-staline" }
         #
-        # We now replace only the selected FortiGate entry and keep
-        # all other existing package targets unchanged.
+        # while FortiManager GUI resolves/display additional device
+        # information from the managed-device database.
         # ========================================================
 
-        - name: Build complete Installation Target object
+        - name: Determine whether Installation Target mapping is required
           ansible.builtin.set_fact:
-            desired_scope_member:
-              name: "{{ authorized_device_full.name }}"
-              oid: "{{ authorized_device_full.oid | string }}"
-              vdom: "{{ target_vdom }}"
-              vdom_oid: "{{ target_vdom_oid | string }}"
-
-
-        # ========================================================
-        # 8.31 REBUILD PACKAGE SCOPE WITHOUT LOSING OTHER TARGETS
-        # ========================================================
-
-        - name: Build synchronized package scope
-          ansible.builtin.set_fact:
-            synchronized_scope_members: >-
+            installation_target_exists: >-
               {{
                 (
                   current_scope_members
-                  | rejectattr(
-                      'name',
-                      'defined'
-                    )
-                  | list
-                )
-                +
-                (
-                  current_scope_members
+                  | selectattr('name', 'defined')
                   | selectattr(
-                      'name',
-                      'defined'
-                    )
-                  | rejectattr(
                       'name',
                       'equalto',
                       authorized_device_full.name
                     )
                   | list
-                )
-                +
-                [desired_scope_member]
+                  | length
+                ) > 0
               }}
 
 
         # ========================================================
-        # 8.32 DISPLAY TARGET TO BE SYNCHRONIZED
+        # 8.30 DISPLAY MAPPING DECISION
         # ========================================================
 
-        - name: Display Installation Target synchronization plan
+        - name: Display Installation Target mapping decision
           ansible.builtin.debug:
             msg:
               - "=============================================="
-              - "INSTALLATION TARGET SYNCHRONIZATION"
+              - "INSTALLATION TARGET MAPPING"
               - "=============================================="
               - "Policy Package : {{ policy_package }}"
-              - "Device         : {{ authorized_device_full.name }}"
+              - "FortiGate      : {{ authorized_device_full.name }}"
               - "IP             : {{ authorized_device_full.ip | default(expected_management_ip) }}"
-              - "OID            : {{ authorized_device_full.oid }}"
-              - "VDOM           : {{ target_vdom }}"
-              - "VDOM OID       : {{ target_vdom_oid }}"
+              - "Serial         : {{ authorized_device_full.sn }}"
+              - "Target ADOM    : {{ target_adom }}"
+              - "Action         : {{ 'ALREADY MAPPED' if installation_target_exists | bool else 'MAPPING REQUIRED' }}"
               - "=============================================="
 
 
         # ========================================================
-        # 8.33 SYNCHRONIZE PACKAGE INSTALLATION TARGET
+        # 8.31 ADD FORTIGATE TO PACKAGE SCOPE
         # ========================================================
         #
-        # SET is intentional here because the existing automated
-        # entry may already exist but be incomplete. ADD would return
-        # "already exists" and would not repair that entry.
+        # This is intentionally the same API operation used by the
+        # earlier working policy-package management implementation:
         #
-        # The complete existing scope is preserved; only the selected
-        # FortiGate entry is replaced.
+        # /pm/pkg/adom/<adom>/<package>/scope member
+        #
+        # We use ADD rather than SET.
+        #
+        # This is safer because:
+        #   - existing Installation Targets are preserved
+        #   - we do not overwrite the complete package object
+        #   - an existing mapping is simply skipped
         # ========================================================
 
-        - name: Synchronize Installation Target with FortiManager
+        - name: Add FortiGate to Installation Target scope
           ansible.builtin.uri:
             url: "https://{{ fortimanager_host }}/jsonrpc"
             method: POST
@@ -949,45 +901,46 @@
             body_format: json
             body:
               id: 10
-              method: "set"
+              method: "add"
               session: "{{ fmg_session }}"
               params:
-                - url: "/pm/pkg/adom/{{ target_adom }}/{{ policy_package }}"
+                - url: >-
+                    /pm/pkg/adom/{{ target_adom }}/{{ policy_package }}/scope member
                   data:
-                    "scope member": "{{ synchronized_scope_members }}"
+                    name: "{{ authorized_device_full.name }}"
+                    vdom: "{{ target_vdom }}"
             return_content: true
-          register: scope_sync_response
+          register: scope_add_response
           no_log: true
+          when:
+            - not installation_target_exists | bool
 
           failed_when:
-            - scope_sync_response.json.result is not defined
-              or scope_sync_response.json.result | length == 0
-              or scope_sync_response.json.result[0].status.code | int != 0
+            - scope_add_response.json.result is not defined
+              or scope_add_response.json.result | length == 0
+              or scope_add_response.json.result[0].status.code | int not in [0, 2]
 
 
         # ========================================================
-        # 8.34 VERIFY SCOPE SYNCHRONIZATION REQUEST
+        # 8.32 DISPLAY MAPPING RESULT
         # ========================================================
 
-        - name: Verify Installation Target synchronization request
-          ansible.builtin.assert:
-            that:
-              - scope_sync_response.json.result is defined
-              - scope_sync_response.json.result | length > 0
-              - scope_sync_response.json.result[0].status.code | int == 0
-            fail_msg: >-
-              FortiManager rejected the Installation Target
-              synchronization request.
-
-              Package : {{ policy_package }}
-              Device  : {{ authorized_device_full.name }}
-            success_msg: >-
-              FortiManager accepted the Installation Target
-              synchronization request.
+        - name: Display Installation Target mapping result
+          ansible.builtin.debug:
+            msg:
+              - "=============================================="
+              - "INSTALLATION TARGET RESULT"
+              - "=============================================="
+              - "Policy Package : {{ policy_package }}"
+              - "FortiGate      : {{ authorized_device_full.name }}"
+              - "IP             : {{ authorized_device_full.ip | default(expected_management_ip) }}"
+              - "Serial         : {{ authorized_device_full.sn }}"
+              - "Action         : {{ 'ALREADY MAPPED' if installation_target_exists | bool else 'ADDED TO SCOPE' }}"
+              - "=============================================="
 
 
         # ========================================================
-        # 8.35 READ FINAL POLICY PACKAGE STATE
+        # 8.33 READ FINAL POLICY PACKAGE STATE
         # ========================================================
 
         - name: Read final policy package state
@@ -1017,15 +970,11 @@
 
 
         # ========================================================
-        # 8.36 SAVE FINAL SCOPE
+        # 8.34 SAVE FINAL SCOPE
         # ========================================================
 
         - name: Save final package scope
           ansible.builtin.set_fact:
-            final_package_data: >-
-              {{
-                final_package_response.json.result[0].data
-              }}
             final_scope_members: >-
               {{
                 final_package_response.json.result[0].data.get(
@@ -1036,7 +985,7 @@
 
 
         # ========================================================
-        # 8.37 FIND FINAL INSTALLATION TARGET
+        # 8.35 FIND FINAL INSTALLATION TARGET
         # ========================================================
 
         - name: Initialize final Installation Target
@@ -1054,32 +1003,40 @@
 
 
         # ========================================================
-        # 8.38 VERIFY FINAL INSTALLATION TARGET
+        # 8.36 VERIFY FINAL INSTALLATION TARGET
+        # ========================================================
+        #
+        # Only the package and FortiGate mapping are verified.
+        #
+        # No VDOM verification.
+        # No vdom_oid verification.
+        # No IP/platform verification against the scope object.
+        #
+        # IP/platform are displayed from the managed FortiGate object,
+        # which is the authoritative DVM device record.
         # ========================================================
 
         - name: Verify final Installation Target
           ansible.builtin.assert:
             that:
-              - final_package_data.name == policy_package
+              - final_package_response.json.result[0].data.name == policy_package
               - final_scope_member | length > 0
               - final_scope_member.name == authorized_device_full.name
-              - final_scope_member.oid | string == authorized_device_full.oid | string
             fail_msg: >-
               Installation Target verification failed.
 
               Policy Package : {{ policy_package }}
               Expected Device: {{ authorized_device_full.name }}
-              Expected OID   : {{ authorized_device_full.oid }}
 
               Final Scope:
               {{ final_scope_members }}
             success_msg: >-
-              Installation Target is correctly synchronized with
-              the managed FortiGate.
+              Installation Target is correctly mapped to the managed
+              FortiGate.
 
 
         # ========================================================
-        # 8.39 DISPLAY FINAL INSTALLATION TARGET
+        # 8.37 DISPLAY FINAL INSTALLATION TARGET
         # ========================================================
 
         - name: Display final Installation Target
@@ -1093,13 +1050,13 @@
               - "IP             : {{ authorized_device_full.ip | default(expected_management_ip) }}"
               - "Serial         : {{ authorized_device_full.sn }}"
               - "OID            : {{ authorized_device_full.oid }}"
-              - "VDOM           : {{ final_scope_member.vdom }}"
-              - "VDOM OID       : {{ final_scope_member.vdom_oid }}"
+              - "Target ADOM    : {{ target_adom }}"
+              - "Target VDOM    : {{ target_vdom }}"
               - "=================================================="
 
 
         # ========================================================
-        # 8.40 FINAL SUCCESS MESSAGE
+        # 8.38 FINAL SUCCESS MESSAGE
         # ========================================================
 
         - name: Display Step 04 success
@@ -1115,18 +1072,14 @@
               - "Target ADOM          : {{ target_adom }}"
               - "Target VDOM          : {{ target_vdom }}"
               - "Policy Package       : {{ policy_package }}"
-              - "VDOM Verification    : NOT PERFORMED"
               - "Authorization        : SUCCESS"
               - "Installation Target  : SUCCESS"
-              - "Installation Target  : {{ final_scope_member.name }}"
-              - "Target IP            : {{ authorized_device_full.ip | default(expected_management_ip) }}"
-              - "Target OID           : {{ final_scope_member.oid }}"
-              - "Target VDOM          : {{ final_scope_member.vdom }}"
-              - "Target VDOM OID      : {{ final_scope_member.vdom_oid }}"
+              - "Mapped FortiGate     : {{ final_scope_member.name }}"
+              - "Mapped IP            : {{ authorized_device_full.ip | default(expected_management_ip) }}"
+              - "VDOM Verification    : NOT PERFORMED"
               - "----------------------------------------------------------"
               - "VERIFICATION COMPLETE - EVERYTHING IS OK"
               - "=========================================================="
-
 
       # ==========================================================
       # 9. ALWAYS LOGOUT
