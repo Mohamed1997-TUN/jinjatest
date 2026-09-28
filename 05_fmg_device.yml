@@ -1,617 +1,650 @@
 ---
 - name: Step 4 - FortiManager Enforce Device Names
-  hosts: localhost
+  hosts: all
+  connection: local
   gather_facts: false
 
-  # ============================================================
-  # CENTRALIZED VARIABLES
-  # ============================================================
-
   vars_files:
-    - ../vars/secrets.yml
     - ../vars/fortimanager.vars
-    - ../vars/firewalls.vars
 
   vars:
     fmg_validate_certs: false
 
-    # Target ADOM
-    adom: "dhia"
-
   tasks:
 
     # ============================================================
-    # 1. LOGIN TO FORTIMANAGER
+    # 1. READ FIREWALL DATABASE
+    # ============================================================
+    #
+    # Do not load firewalls.vars through vars_files because it may
+    # contain vault_* references for multiple FortiGates.
+    #
+    # Read it as raw YAML and select only the device represented by
+    # the current NetBox inventory host.
     # ============================================================
 
-    - name: Login to FortiManager
-      ansible.builtin.uri:
-        url: "https://{{ fortimanager_host }}/jsonrpc"
-        method: POST
-        validate_certs: "{{ fmg_validate_certs }}"
-        headers:
-          Content-Type: application/json
-        body_format: json
-        body:
-          id: 1
-          method: "exec"
-          params:
-            - url: "/sys/login/user"
-              data:
-                user: "{{ fortimanager_user }}"
-                passwd: "{{ fortimanager_password }}"
-        return_content: true
-      register: fmg_login
-      no_log: true
-
-
-    # ============================================================
-    # 2. VERIFY LOGIN
-    # ============================================================
-
-    - name: Verify FortiManager login
-      ansible.builtin.assert:
-        that:
-          - fmg_login.json.result is defined
-          - fmg_login.json.result | length > 0
-          - fmg_login.json.result[0].status.code | int == 0
-          - fmg_login.json.session is defined
-        fail_msg: "FortiManager authentication failed."
-        success_msg: "FortiManager authentication successful."
-
-
-    # ============================================================
-    # 3. SAVE SESSION
-    # ============================================================
-
-    - name: Save FortiManager session
+    - name: Read firewall database
       ansible.builtin.set_fact:
-        fmg_session: "{{ fmg_login.json.session }}"
-      no_log: true
-
-
-    # ============================================================
-    # 4. GET DEVICES FROM TARGET ADOM
-    # ============================================================
-
-    - name: Get FortiGate devices from FortiManager
-      ansible.builtin.uri:
-        url: "https://{{ fortimanager_host }}/jsonrpc"
-        method: POST
-        validate_certs: "{{ fmg_validate_certs }}"
-        headers:
-          Content-Type: application/json
-        body_format: json
-        body:
-          id: 2
-          method: "get"
-          session: "{{ fmg_session }}"
-          params:
-            - url: "/dvmdb/adom/{{ adom }}/device"
-        return_content: true
-      register: fmg_devices
-      no_log: true
-
-
-    # ============================================================
-    # 5. VERIFY DEVICE DISCOVERY
-    # ============================================================
-
-    - name: Verify device discovery
-      ansible.builtin.assert:
-        that:
-          - fmg_devices.json.result is defined
-          - fmg_devices.json.result | length > 0
-          - fmg_devices.json.result[0].status.code | int == 0
-          - fmg_devices.json.result[0].data is defined
-        fail_msg: >-
-          FortiManager device discovery failed for ADOM {{ adom }}.
-        success_msg: >-
-          FortiManager devices successfully discovered
-          from ADOM {{ adom }}.
-
-
-    # ============================================================
-    # 6. SAVE MANAGED DEVICES
-    # ============================================================
-
-    - name: Save managed devices
-      ansible.builtin.set_fact:
-        managed_devices: "{{ fmg_devices.json.result[0].data }}"
-
-
-    # ============================================================
-    # 7. INITIALIZE LISTS
-    # ============================================================
-
-    - name: Initialize summary lists
-      ansible.builtin.set_fact:
-        existing_firewalls: []
-        synchronized_devices: []
-        renamed_devices: []
-        unchanged_devices: []
-        skipped_devices: []
-
-
-    # ============================================================
-    # 8. BUILD DESIRED/CURRENT DEVICE MAPPING
-    #
-    # firewalls.vars remains centralized and contains:
-    #
-    #   serial
-    #   hostname
-    #   management_ip
-    #   management_mask
-    #   api_token
-    #
-    # api_token is NOT used by Step 4.
-    # It remains available for other automation steps.
-    #
-    # If a device is not found:
-    #
-    #   current_device = {}
-    #
-    # If a device is found:
-    #
-    #   current_device = FortiManager device object
-    # ============================================================
-
-    - name: Build desired/current device mapping
-      ansible.builtin.set_fact:
-        existing_firewalls: "{{ existing_firewalls + [firewall_entry] }}"
-
-      vars:
-
-        matching_devices: >-
+        firewall_data: >-
           {{
-            managed_devices
-            | selectattr('sn', 'defined')
-            | selectattr('sn', 'equalto', item.serial)
-            | list
+            lookup(
+              'ansible.builtin.file',
+              playbook_dir + '/../vars/firewalls.vars'
+            )
+            | from_yaml
           }}
 
-        firewall_entry:
-          serial: "{{ item.serial }}"
-          desired_name: "{{ item.hostname }}"
-          management_ip: "{{ item.management_ip }}"
-          management_mask: "{{ item.management_mask }}"
 
-          current_device: >-
-            {{
-              matching_devices[0]
-              if matching_devices | length > 0
-              else {}
-            }}
+    # ============================================================
+    # 2. SELECT FIREWALL USING NETBOX ASSET TAG
+    # ============================================================
 
-      loop: "{{ firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
+    - name: Select firewall using NetBox asset tag
+      ansible.builtin.set_fact:
+        selected_firewall: >-
+          {{
+            firewall_data.firewalls
+            | selectattr(
+                'serial',
+                'equalto',
+                asset_tag | default('')
+              )
+            | list
+            | first
+            | default({})
+          }}
 
 
     # ============================================================
-    # 9. DISPLAY CURRENT STATE
+    # 3. SKIP UNKNOWN FIREWALL
     # ============================================================
 
-    - name: Display firewall state
+    - name: Display unknown firewall
       ansible.builtin.debug:
         msg:
-          serial: "{{ item.serial }}"
-
-          desired_name: "{{ item.desired_name }}"
-
-          desired_ip: "{{ item.management_ip }}"
-
-          current_name: >-
-            {{
-              item.current_device.get('name', 'NOT FOUND')
-            }}
-
-          current_ip: >-
-            {{
-              item.current_device.get('ip', 'NOT FOUND')
-            }}
-
-          status: >-
-            {{
-              "FOUND"
-              if (item.current_device | length) > 0
-              else "NOT FOUND - SKIP"
-            }}
-
-      loop: "{{ existing_firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
-
-
-    # ============================================================
-    # 10. RECORD MISSING DEVICES
-    #
-    # Missing devices are NOT failures.
-    # ============================================================
-
-    - name: Record missing devices
-      ansible.builtin.set_fact:
-        skipped_devices: >-
-          {{
-            skipped_devices
-            +
-            [
-              item.serial
-              ~ " -> "
-              ~ item.desired_name
-            ]
-          }}
-
-      loop: "{{ existing_firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
+          - "=============================================="
+          - "FORTIGATE NOT IN FIREWALL DATABASE"
+          - "=============================================="
+          - "NetBox Asset Tag : {{ asset_tag | default('undefined') }}"
+          - "Action           : SKIPPED"
+          - "=============================================="
 
       when:
-        - (item.current_device | length) == 0
+        - selected_firewall | length == 0
 
 
-    # ============================================================
-    # 11. RECORD ALREADY CORRECT DEVICES
-    # ============================================================
-
-    - name: Record devices with correct names
-      ansible.builtin.set_fact:
-        unchanged_devices: >-
-          {{
-            unchanged_devices
-            +
-            [
-              item.serial
-              ~ " -> "
-              ~ item.desired_name
-            ]
-          }}
-
-      loop: "{{ existing_firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
+    - name: End host for unknown firewall
+      ansible.builtin.meta: end_host
 
       when:
-        - (item.current_device | length) > 0
-        - item.current_device.get('name') == item.desired_name
+        - selected_firewall | length == 0
 
 
     # ============================================================
-    # 12. RENAME DEVICES
+    # 4. VALIDATE SELECTED FIREWALL
+    # ============================================================
+
+    - name: Validate selected firewall
+      ansible.builtin.assert:
+        that:
+          - selected_firewall.serial is defined
+          - selected_firewall.hostname is defined
+          - selected_firewall.target_adom is defined
+
+        fail_msg: >-
+          Firewall {{ asset_tag }}
+          exists in firewalls.vars but is missing required fields.
+
+          Required:
+          serial
+          hostname
+          target_adom
+
+        success_msg: >-
+          Firewall {{ selected_firewall.serial }}
+          contains all required device-name parameters.
+
+
+    # ============================================================
+    # 5. SAVE TARGET PARAMETERS
+    # ============================================================
+
+    - name: Save target firewall parameters
+      ansible.builtin.set_fact:
+        device_serial: "{{ selected_firewall.serial }}"
+        desired_name: "{{ selected_firewall.hostname }}"
+        target_adom: "{{ selected_firewall.target_adom }}"
+
+
+    # ============================================================
+    # 6. NORMALIZE SERIAL FOR COMPARISON
+    # ============================================================
     #
-    # Only existing devices with a different name are renamed.
+    # Example:
+    #
+    # NetBox:
+    #   FGVMEVP1E5VM0ED
+    #
+    # FortiManager:
+    #   FGVMEVP1_E5VM0ED
+    #
+    # The original values are never modified.
     # ============================================================
 
-    - name: Enforce desired FortiManager device names
-      ansible.builtin.uri:
-        url: "https://{{ fortimanager_host }}/jsonrpc"
-        method: POST
-        validate_certs: "{{ fmg_validate_certs }}"
-        headers:
-          Content-Type: application/json
-        body_format: json
+    - name: Normalize FortiGate serial
+      ansible.builtin.set_fact:
+        normalized_device_serial: >-
+          {{
+            device_serial
+            | regex_replace('[^A-Za-z0-9]', '')
+            | upper
+          }}
 
-        body:
-          id: 10
-          method: "update"
-          session: "{{ fmg_session }}"
 
-          params:
-            - url: >-
-                /dvmdb/adom/{{ adom }}/device/{{
-                  item.current_device.get('name')
+    # ============================================================
+    # 7. DISPLAY TARGET
+    # ============================================================
+
+    - name: Display device-name target
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "FORTIMANAGER DEVICE NAME TARGET"
+          - "=============================================="
+          - "NetBox Asset Tag  : {{ asset_tag }}"
+          - "Serial            : {{ device_serial }}"
+          - "Normalized Serial : {{ normalized_device_serial }}"
+          - "Desired Name      : {{ desired_name }}"
+          - "Target ADOM       : {{ target_adom }}"
+          - "=============================================="
+
+
+    # ============================================================
+    # 8. FORTIMANAGER WORKFLOW
+    # ============================================================
+
+    - name: Execute FortiManager device-name workflow
+      block:
+
+        # ========================================================
+        # 8.1 LOGIN
+        # ========================================================
+
+        - name: Login to FortiManager
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            validate_certs: "{{ fmg_validate_certs }}"
+
+            headers:
+              Content-Type: application/json
+
+            body_format: json
+
+            body:
+              id: 1
+              method: "exec"
+
+              params:
+                - url: "/sys/login/user"
+                  data:
+                    user: "{{ fortimanager_user }}"
+                    passwd: "{{ fortimanager_password }}"
+
+            return_content: true
+
+          register: fmg_login
+
+          no_log: true
+
+
+        # ========================================================
+        # 8.2 VERIFY LOGIN
+        # ========================================================
+
+        - name: Verify FortiManager authentication
+          ansible.builtin.assert:
+            that:
+              - fmg_login.json.result is defined
+              - fmg_login.json.result | length > 0
+              - fmg_login.json.result[0].status.code | int == 0
+              - fmg_login.json.session is defined
+
+            fail_msg: "FortiManager authentication failed."
+
+            success_msg: "FortiManager authentication successful."
+
+
+        # ========================================================
+        # 8.3 SAVE SESSION
+        # ========================================================
+
+        - name: Save FortiManager session
+          ansible.builtin.set_fact:
+            fmg_session: "{{ fmg_login.json.session }}"
+
+          no_log: true
+
+
+        # ========================================================
+        # 8.4 GET DEVICES FROM TARGET ADOM
+        # ========================================================
+        #
+        # target_adom comes from firewalls.vars.
+        # ========================================================
+
+        - name: Get FortiGate devices from target ADOM
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            validate_certs: "{{ fmg_validate_certs }}"
+
+            headers:
+              Content-Type: application/json
+
+            body_format: json
+
+            body:
+              id: 2
+              method: "get"
+              session: "{{ fmg_session }}"
+
+              params:
+                - url: "/dvmdb/adom/{{ target_adom }}/device"
+
+            return_content: true
+
+          register: fmg_devices
+
+          retries: 6
+          delay: 3
+
+          until:
+            - fmg_devices.json.result is defined
+            - fmg_devices.json.result | length > 0
+            - fmg_devices.json.result[0].status.code | int == 0
+            - fmg_devices.json.result[0].data is defined
+
+          no_log: true
+
+
+        # ========================================================
+        # 8.5 VERIFY DEVICE DISCOVERY
+        # ========================================================
+
+        - name: Verify device discovery
+          ansible.builtin.assert:
+            that:
+              - fmg_devices.json.result is defined
+              - fmg_devices.json.result | length > 0
+              - fmg_devices.json.result[0].status.code | int == 0
+              - fmg_devices.json.result[0].data is defined
+
+            fail_msg: >-
+              FortiManager device discovery failed for ADOM
+              {{ target_adom }}.
+
+            success_msg: >-
+              FortiManager devices successfully discovered from
+              ADOM {{ target_adom }}.
+
+
+        # ========================================================
+        # 8.6 INITIALIZE CURRENT DEVICE
+        # ========================================================
+
+        - name: Initialize current device
+          ansible.builtin.set_fact:
+            current_device: {}
+
+
+        # ========================================================
+        # 8.7 FIND DEVICE BY NORMALIZED SERIAL
+        # ========================================================
+
+        - name: Find target FortiGate by normalized serial
+          ansible.builtin.set_fact:
+            current_device: "{{ item }}"
+
+          loop: "{{ fmg_devices.json.result[0].data | default([]) }}"
+
+          when:
+            - item.sn is defined
+            - >
+              (
+                item.sn
+                | regex_replace('[^A-Za-z0-9]', '')
+                | upper
+              ) == normalized_device_serial
+
+
+        # ========================================================
+        # 8.8 DISPLAY CURRENT STATE
+        # ========================================================
+
+        - name: Display current FortiManager device state
+          ansible.builtin.debug:
+            msg:
+              - "=============================================="
+              - "FORTIMANAGER DEVICE STATE"
+              - "=============================================="
+              - "Serial        : {{ device_serial }}"
+              - "Desired Name  : {{ desired_name }}"
+              - "Current Name  : {{ current_device.name | default('NOT FOUND') }}"
+              - "Current IP    : {{ current_device.ip | default('NOT FOUND') }}"
+              - "Current OID   : {{ current_device.oid | default('NOT FOUND') }}"
+              - "Target ADOM   : {{ target_adom }}"
+              - "=============================================="
+
+
+        # ========================================================
+        # 8.9 VERIFY DEVICE EXISTS
+        # ========================================================
+
+        - name: Verify target FortiGate exists
+          ansible.builtin.assert:
+            that:
+              - current_device | length > 0
+
+            fail_msg: >-
+              FortiGate {{ device_serial }}
+              was not found in ADOM {{ target_adom }}.
+
+            success_msg: >-
+              FortiGate {{ device_serial }}
+              was found in ADOM {{ target_adom }}.
+
+
+        # ========================================================
+        # 8.10 DETERMINE WHETHER RENAME IS REQUIRED
+        # ========================================================
+
+        - name: Determine device-name synchronization state
+          ansible.builtin.set_fact:
+            rename_required: >-
+              {{
+                current_device.name | default('')
+                != desired_name
+              }}
+
+
+        # ========================================================
+        # 8.11 DISPLAY RENAME DECISION
+        # ========================================================
+
+        - name: Display rename decision
+          ansible.builtin.debug:
+            msg:
+              - "=============================================="
+              - "DEVICE NAME DECISION"
+              - "=============================================="
+              - "Current Name : {{ current_device.name | default('NOT FOUND') }}"
+              - "Desired Name : {{ desired_name }}"
+              - "Rename       : {{ rename_required }}"
+              - "=============================================="
+
+
+        # ========================================================
+        # 8.12 RENAME DEVICE
+        # ========================================================
+        #
+        # Only rename when the current name differs.
+        # ========================================================
+
+        - name: Enforce desired FortiManager device name
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            validate_certs: "{{ fmg_validate_certs }}"
+
+            headers:
+              Content-Type: application/json
+
+            body_format: json
+
+            body:
+              id: 3
+              method: "update"
+              session: "{{ fmg_session }}"
+
+              params:
+                - url: >-
+                    /dvmdb/adom/{{ target_adom }}/device/{{
+                      current_device.name
+                    }}
+
+                  data:
+                    name: "{{ desired_name }}"
+
+            return_content: true
+
+          register: rename_result
+
+          no_log: true
+
+          retries: 3
+          delay: 3
+
+          until:
+            - rename_result.json.result is defined
+            - rename_result.json.result | length > 0
+            - rename_result.json.result[0].status.code | int == 0
+
+          when:
+            - rename_required | bool
+
+
+        # ========================================================
+        # 8.13 VERIFY RENAME REQUEST
+        # ========================================================
+
+        - name: Verify rename request
+          ansible.builtin.assert:
+            that:
+              - rename_result.json.result is defined
+              - rename_result.json.result | length > 0
+              - rename_result.json.result[0].status.code | int == 0
+
+            fail_msg: >-
+              Device rename failed for FortiGate {{ device_serial }}.
+
+              Old Name:
+              {{ current_device.name | default('N/A') }}
+
+              New Name:
+              {{ desired_name }}
+
+              Response:
+              {{ rename_result.json | default('N/A') }}
+
+            success_msg: >-
+              FortiGate {{ device_serial }}
+              was renamed successfully:
+
+              {{ current_device.name }}
+              ->
+              {{ desired_name }}
+
+          when:
+            - rename_required | bool
+
+
+        # ========================================================
+        # 8.14 REPORT ALREADY CORRECT
+        # ========================================================
+
+        - name: Display device already correctly named
+          ansible.builtin.debug:
+            msg:
+              - "=============================================="
+              - "DEVICE NAME ALREADY CORRECT"
+              - "=============================================="
+              - "Serial : {{ device_serial }}"
+              - "Name   : {{ desired_name }}"
+              - "ADOM   : {{ target_adom }}"
+              - "Action : NO CHANGE REQUIRED"
+              - "=============================================="
+
+          when:
+            - not rename_required | bool
+
+
+        # ========================================================
+        # 8.15 REFRESH DEVICE LIST
+        # ========================================================
+        #
+        # After a rename, refresh the DVM database before final
+        # verification.
+        #
+        # Retry protects against short propagation delays.
+        # ========================================================
+
+        - name: Refresh FortiManager device list
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            validate_certs: "{{ fmg_validate_certs }}"
+
+            headers:
+              Content-Type: application/json
+
+            body_format: json
+
+            body:
+              id: 4
+              method: "get"
+              session: "{{ fmg_session }}"
+
+              params:
+                - url: "/dvmdb/adom/{{ target_adom }}/device"
+
+            return_content: true
+
+          register: refreshed_devices
+
+          retries: 6
+          delay: 3
+
+          until:
+            - refreshed_devices.json.result is defined
+            - refreshed_devices.json.result | length > 0
+            - refreshed_devices.json.result[0].status.code | int == 0
+            - refreshed_devices.json.result[0].data is defined
+
+          no_log: true
+
+
+        # ========================================================
+        # 8.16 INITIALIZE FINAL DEVICE
+        # ========================================================
+
+        - name: Initialize final device
+          ansible.builtin.set_fact:
+            final_device: {}
+
+
+        # ========================================================
+        # 8.17 FIND FINAL DEVICE BY NORMALIZED SERIAL
+        # ========================================================
+
+        - name: Find final FortiGate state
+          ansible.builtin.set_fact:
+            final_device: "{{ item }}"
+
+          loop: "{{ refreshed_devices.json.result[0].data | default([]) }}"
+
+          when:
+            - item.sn is defined
+            - >
+              (
+                item.sn
+                | regex_replace('[^A-Za-z0-9]', '')
+                | upper
+              ) == normalized_device_serial
+
+
+        # ========================================================
+        # 8.18 VERIFY FINAL DEVICE STATE
+        # ========================================================
+
+        - name: Verify final device state
+          ansible.builtin.assert:
+            that:
+              - final_device | length > 0
+              - final_device.name | default('') == desired_name
+
+            fail_msg: >-
+              Final verification failed for FortiGate
+              {{ device_serial }}.
+
+              Expected:
+              Name = {{ desired_name }}
+
+              Actual:
+              Name = {{ final_device.name | default('N/A') }}
+
+            success_msg: >-
+              FortiGate {{ device_serial }}
+              is correctly synchronized in ADOM {{ target_adom }}.
+
+              Name:
+              {{ final_device.name }}
+
+
+        # ========================================================
+        # 8.19 FINAL RESULT
+        # ========================================================
+
+        - name: Display Step 05 result
+          ansible.builtin.debug:
+            msg:
+              - "=================================================="
+              - "STEP 05 - FORTIMANAGER DEVICE NAME MANAGEMENT"
+              - "=================================================="
+              - "NetBox Asset Tag : {{ asset_tag }}"
+              - "Serial           : {{ device_serial }}"
+              - "Target ADOM      : {{ target_adom }}"
+              - "Current Name     : {{ final_device.name }}"
+              - "Desired Name     : {{ desired_name }}"
+              - >-
+                {{
+                  'RENAMED'
+                  if rename_required | bool
+                  else
+                  'ALREADY CORRECT'
                 }}
+              - "Verification     : SUCCESS"
+              - "=================================================="
 
-              data:
-                name: "{{ item.desired_name }}"
 
-        return_content: true
+      # ==========================================================
+      # 9. ALWAYS LOGOUT
+      # ==========================================================
 
-      register: rename_results
+      always:
 
-      no_log: true
+        - name: Logout from FortiManager
+          ansible.builtin.uri:
+            url: "https://{{ fortimanager_host }}/jsonrpc"
+            method: POST
+            validate_certs: "{{ fmg_validate_certs }}"
 
-      loop: "{{ existing_firewalls }}"
+            headers:
+              Content-Type: application/json
 
-      loop_control:
-        label: "{{ item.serial }}"
+            body_format: json
 
-      when:
-        - (item.current_device | length) > 0
-        - item.current_device.get('name') != item.desired_name
+            body:
+              id: 5
+              method: "exec"
+              session: "{{ fmg_session }}"
 
+              params:
+                - url: "/sys/logout"
 
-    # ============================================================
-    # 13. VERIFY RENAME OPERATIONS
-    # ============================================================
+            return_content: true
 
-    - name: Verify rename operations
-      ansible.builtin.assert:
-        that:
-          - item.json.result is defined
-          - item.json.result | length > 0
-          - item.json.result[0].status.code | int == 0
+          no_log: true
 
-        fail_msg: >-
-          Device rename failed for {{ item.item.serial }}.
-
-          Old name:
-          {{ item.item.current_device.get('name', 'N/A') }}
-
-          New name:
-          {{ item.item.desired_name }}
-
-          Response:
-          {{ item.json | default('N/A') }}
-
-        success_msg: >-
-          Device {{ item.item.serial }} renamed successfully:
-          {{ item.item.current_device.get('name', 'N/A') }}
-          ->
-          {{ item.item.desired_name }}
-
-      loop: "{{ rename_results.results | default([]) }}"
-
-      loop_control:
-        label: "{{ item.item.serial }}"
-
-      when:
-        - not (item.skipped | default(false))
-
-
-    # ============================================================
-    # 14. BUILD RENAMED SUMMARY
-    # ============================================================
-
-    - name: Build renamed devices summary
-      ansible.builtin.set_fact:
-        renamed_devices: >-
-          {{
-            renamed_devices
-            +
-            [
-              item.item.serial
-              ~ " : "
-              ~ item.item.current_device.get('name', 'N/A')
-              ~ " -> "
-              ~ item.item.desired_name
-            ]
-          }}
-
-      loop: "{{ rename_results.results | default([]) }}"
-
-      loop_control:
-        label: "{{ item.item.serial }}"
-
-      when:
-        - not (item.skipped | default(false))
-
-
-    # ============================================================
-    # 15. REFRESH DEVICE LIST
-    # ============================================================
-
-    - name: Refresh FortiManager devices
-      ansible.builtin.uri:
-        url: "https://{{ fortimanager_host }}/jsonrpc"
-        method: POST
-        validate_certs: "{{ fmg_validate_certs }}"
-        headers:
-          Content-Type: application/json
-        body_format: json
-
-        body:
-          id: 11
-          method: "get"
-          session: "{{ fmg_session }}"
-
-          params:
-            - url: "/dvmdb/adom/{{ adom }}/device"
-
-        return_content: true
-
-      register: refreshed_devices
-
-      no_log: true
-
-
-    # ============================================================
-    # 16. VERIFY REFRESH
-    # ============================================================
-
-    - name: Verify refreshed device discovery
-      ansible.builtin.assert:
-        that:
-          - refreshed_devices.json.result is defined
-          - refreshed_devices.json.result | length > 0
-          - refreshed_devices.json.result[0].status.code | int == 0
-          - refreshed_devices.json.result[0].data is defined
-
-        fail_msg:
-          "Unable to refresh FortiManager device list."
-
-        success_msg:
-          "FortiManager device list refreshed successfully."
-
-
-    # ============================================================
-    # 17. FINAL VERIFICATION
-    #
-    # Existing devices are verified.
-    # Missing devices remain skipped.
-    # ============================================================
-
-    - name: Verify final device state
-      ansible.builtin.assert:
-
-        that:
-          - final_device is not none
-          - final_device.get('name') == item.desired_name
-          - final_device.get('sn') == item.serial
-          - final_device.get('ip') == item.management_ip
-
-        fail_msg: >-
-          Final verification failed for {{ item.serial }}.
-
-          Expected:
-
-            Name = {{ item.desired_name }}
-            IP   = {{ item.management_ip }}
-
-          Actual:
-
-            Name = {{ final_device.get('name', 'N/A') }}
-            IP   = {{ final_device.get('ip', 'N/A') }}
-
-        success_msg: >-
-          {{ item.serial }} synchronized successfully:
-          {{ final_device.get('name') }} /
-          {{ final_device.get('ip') }}
-
-      vars:
-
-        matching_final_devices: >-
-          {{
-            refreshed_devices.json.result[0].data
-            | selectattr('sn', 'defined')
-            | selectattr('sn', 'equalto', item.serial)
-            | list
-          }}
-
-        final_device: >-
-          {{
-            matching_final_devices[0]
-            if matching_final_devices | length > 0
-            else {}
-          }}
-
-      loop: "{{ existing_firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
-
-      when:
-        - (item.current_device | length) > 0
-
-
-    # ============================================================
-    # 18. BUILD SYNCHRONIZED SUMMARY
-    # ============================================================
-
-    - name: Build synchronized devices summary
-      ansible.builtin.set_fact:
-        synchronized_devices: >-
-          {{
-            synchronized_devices
-            +
-            [
-              item.serial
-              ~ " -> "
-              ~ item.desired_name
-            ]
-          }}
-
-      loop: "{{ existing_firewalls }}"
-
-      loop_control:
-        label: "{{ item.serial }}"
-
-      when:
-        - (item.current_device | length) > 0
-
-
-    # ============================================================
-    # 19. FINAL SUMMARY
-    # ============================================================
-
-    - name: Display Step 4 summary
-      ansible.builtin.debug:
-        msg:
-          - "=================================================="
-          - "STEP 4 - FORTIMANAGER DEVICE NAME MANAGEMENT"
-          - "=================================================="
-          - "ADOM                    : {{ adom }}"
-          - "Total desired firewalls : {{ firewalls | length }}"
-          - "Found / synchronized    : {{ synchronized_devices | length }}"
-          - "Renamed                 : {{ renamed_devices | length }}"
-          - "Already correct         : {{ unchanged_devices | length }}"
-          - "Skipped / not found     : {{ skipped_devices | length }}"
-          - "=================================================="
-
-
-    # ============================================================
-    # 20. SHOW SYNCHRONIZED DEVICES
-    # ============================================================
-
-    - name: Display synchronized devices
-      ansible.builtin.debug:
-        msg: "{{ synchronized_devices }}"
-
-      when:
-        - synchronized_devices | length > 0
-
-
-    # ============================================================
-    # 21. SHOW RENAMED DEVICES
-    # ============================================================
-
-    - name: Display renamed devices
-      ansible.builtin.debug:
-        msg: "{{ renamed_devices }}"
-
-      when:
-        - renamed_devices | length > 0
-
-
-    # ============================================================
-    # 22. SHOW UNCHANGED DEVICES
-    # ============================================================
-
-    - name: Display unchanged devices
-      ansible.builtin.debug:
-        msg: "{{ unchanged_devices }}"
-
-      when:
-        - unchanged_devices | length > 0
-
-
-    # ============================================================
-    # 23. SHOW SKIPPED DEVICES
-    # ============================================================
-
-    - name: Display skipped devices
-      ansible.builtin.debug:
-        msg: "{{ skipped_devices }}"
-
-      when:
-        - skipped_devices | length > 0
-
-
-    # ============================================================
-    # 24. LOGOUT
-    # ============================================================
-
-    - name: Logout from FortiManager
-      ansible.builtin.uri:
-        url: "https://{{ fortimanager_host }}/jsonrpc"
-        method: POST
-        validate_certs: "{{ fmg_validate_certs }}"
-        headers:
-          Content-Type: application/json
-        body_format: json
-
-        body:
-          id: 3
-          method: "exec"
-          session: "{{ fmg_session }}"
-
-          params:
-            - url: "/sys/logout"
-
-        return_content: true
-
-      no_log: true
+          when:
+            - fmg_session is defined
