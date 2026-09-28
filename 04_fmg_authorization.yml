@@ -6,7 +6,6 @@
 
   vars_files:
     - vars/fortimanager.vars
-    - vars/firewalls.vars
 
   vars:
 
@@ -17,7 +16,7 @@
     fmg_validate_certs: false
 
     # Unauthorized/unregistered devices always land in root.
-    # This is only used for the initial lookup.
+    # This is only used as the initial lookup context.
     source_adom: "root"
 
     # Destination ADOM
@@ -27,14 +26,48 @@
   tasks:
 
     # ============================================================
-    # 0. FIND FIREWALL FROM NETBOX SERIAL
+    # 0. READ firewalls.vars AS RAW YAML
+    # ============================================================
+    #
+    # IMPORTANT:
+    # Do NOT use firewalls.vars under vars_files.
+    #
+    # The file contains values such as:
+    #
+    # api_token: "{{ vault_milano_api_token }}"
+    #
+    # Those variables are not required for this step.
+    #
+    # Reading the file as raw YAML prevents Ansible from trying
+    # to evaluate those unrelated vault variables.
+    # ============================================================
+
+    - name: Read firewalls.vars as raw YAML
+      ansible.builtin.set_fact:
+        firewall_data: >-
+          {{
+            lookup(
+              'ansible.builtin.file',
+              playbook_dir ~ '/../vars/firewalls.vars'
+            )
+            | from_yaml
+          }}
+
+
+    # ============================================================
+    # 1. FIND FIREWALL USING NETBOX SERIAL
+    # ============================================================
+    #
+    # NetBox asset_tag = FortiGate serial
+    #
+    # Only the matching firewall is selected.
     # ============================================================
 
     - name: Find firewall in firewalls.vars using NetBox asset_tag
       ansible.builtin.set_fact:
         selected_firewall: >-
           {{
-            firewalls
+            firewall_data.firewalls
             | selectattr('serial', 'defined')
             | selectattr(
                 'serial',
@@ -48,7 +81,7 @@
 
 
     # ============================================================
-    # 0.1 SKIP FIREWALL NOT DEFINED IN FIREWALLS.VARS
+    # 2. SKIP FIREWALL NOT DEFINED IN firewalls.vars
     # ============================================================
 
     - name: Display skipped firewall
@@ -66,73 +99,93 @@
 
 
     # ============================================================
-    # 0.2 VERIFY REQUIRED FIREWALL VARIABLES
+    # 3. EXTRACT ONLY REQUIRED INFORMATION
+    # ============================================================
+    #
+    # We deliberately do NOT copy api_token.
+    #
+    # Required by this workflow:
+    #
+    #   serial
+    #   hostname
+    #   management_ip
+    #   target_vdom
+    #   policy_package
+    #
+    # management_mask and api_token are ignored.
+    # ============================================================
+
+    - name: Extract required firewall information
+      ansible.builtin.set_fact:
+        device_serial: "{{ selected_firewall.serial }}"
+        device_hostname: "{{ selected_firewall.hostname }}"
+        device_management_ip: "{{ selected_firewall.management_ip }}"
+        device_vdom: "{{ selected_firewall.target_vdom | default('') }}"
+        policy_package: "{{ selected_firewall.policy_package | default('') }}"
+
+
+    # ============================================================
+    # 4. VERIFY REQUIRED FIREWALL VARIABLES
     # ============================================================
 
     - name: Verify required firewall variables
       ansible.builtin.assert:
         that:
-          - selected_firewall.serial is defined
-          - selected_firewall.serial | length > 0
-          - selected_firewall.hostname is defined
-          - selected_firewall.hostname | length > 0
-          - selected_firewall.management_ip is defined
-          - selected_firewall.management_ip | length > 0
-          - selected_firewall.target_vdom is defined
-          - selected_firewall.target_vdom | length > 0
-          - selected_firewall.policy_package is defined
-          - selected_firewall.policy_package | length > 0
+
+          - device_serial is defined
+          - device_serial | length > 0
+
+          - device_hostname is defined
+          - device_hostname | length > 0
+
+          - device_management_ip is defined
+          - device_management_ip | length > 0
+
+          - device_vdom is defined
+          - device_vdom | length > 0
+
+          - policy_package is defined
+          - policy_package | length > 0
 
         fail_msg: >-
-          Firewall {{ asset_tag }}
-          exists in firewalls.vars but its definition is incomplete.
+          Firewall {{ asset_tag | default('unknown') }}
+          exists in firewalls.vars but one or more required
+          fields are missing.
 
           Required fields:
-          serial,
-          hostname,
-          management_ip,
-          target_vdom,
-          policy_package.
+          serial, hostname, management_ip,
+          target_vdom, policy_package.
 
         success_msg: >-
-          Firewall {{ asset_tag }}
-          is correctly defined in firewalls.vars.
+          Required firewall information is available.
 
 
     # ============================================================
-    # 0.3 SAVE DYNAMIC FORTIGATE VARIABLES
-    # ============================================================
-
-    - name: Set dynamic FortiGate variables
-      ansible.builtin.set_fact:
-        device_serial: "{{ selected_firewall.serial }}"
-        device_vdom: "{{ selected_firewall.target_vdom }}"
-        policy_package: "{{ selected_firewall.policy_package }}"
-
-
-    # ============================================================
-    # 0.4 DISPLAY SELECTED FIREWALL
+    # 5. DISPLAY SELECTED FIREWALL
     # ============================================================
 
     - name: Display selected firewall
       ansible.builtin.debug:
         msg:
+
           - "=============================================="
           - "SELECTED FIREWALL"
           - "=============================================="
-          - "NetBox Host       : {{ inventory_hostname }}"
-          - "NetBox Asset Tag  : {{ asset_tag }}"
-          - "Serial            : {{ device_serial }}"
-          - "Hostname          : {{ selected_firewall.hostname }}"
-          - "Management IP     : {{ selected_firewall.management_ip }}"
-          - "Target VDOM       : {{ device_vdom }}"
-          - "Policy Package    : {{ policy_package }}"
-          - "Target ADOM       : {{ target_adom }}"
+
+          - "Inventory Host : {{ inventory_hostname }}"
+          - "NetBox Serial  : {{ asset_tag | default('unknown') }}"
+
+          - "Serial         : {{ device_serial }}"
+          - "Hostname       : {{ device_hostname }}"
+          - "Management IP  : {{ device_management_ip }}"
+          - "Target VDOM    : {{ device_vdom }}"
+          - "Policy Package : {{ policy_package }}"
+
           - "=============================================="
 
 
     # ============================================================
-    # 1. LOGIN TO FORTIMANAGER
+    # 6. LOGIN TO FORTIMANAGER
     # ============================================================
 
     - name: Login to FortiManager
@@ -165,7 +218,7 @@
 
 
     # ============================================================
-    # 2. VERIFY LOGIN
+    # 7. VERIFY LOGIN
     # ============================================================
 
     - name: Verify FortiManager authentication
@@ -183,7 +236,7 @@
 
 
     # ============================================================
-    # 3. SAVE SESSION
+    # 8. SAVE SESSION
     # ============================================================
 
     - name: Save FortiManager session
@@ -195,8 +248,7 @@
 
 
     # ============================================================
-    # 4. FIND TARGET FORTIGATE
-    #    GLOBAL DEVICE TABLE
+    # 9. FIND TARGET FORTIGATE IN GLOBAL DEVICE TABLE
     # ============================================================
 
     - name: Find target FortiGate by serial
@@ -238,7 +290,7 @@
 
 
     # ============================================================
-    # 5. EXTRACT TARGET FORTIGATE
+    # 10. EXTRACT TARGET FORTIGATE
     # ============================================================
 
     - name: Extract target FortiGate
@@ -253,7 +305,7 @@
 
 
     # ============================================================
-    # 6. VERIFY TARGET FORTIGATE
+    # 11. VERIFY TARGET FORTIGATE
     # ============================================================
 
     - name: Verify target FortiGate exists
@@ -266,9 +318,10 @@
           FortiGate {{ device_serial }}
           was not found via /dvmdb/device.
 
-          If it's showing under "Display Hidden Devices" in the
-          GUI, it may be hidden at the database level - authorize
-          it once via the GUI to clear that state, then re-run.
+          If it is showing under "Display Hidden Devices" in the
+          GUI, it may be hidden at the database level.
+          Authorize it once via the GUI to clear that state,
+          then re-run.
 
         success_msg: >-
           FortiGate {{ device_serial }}
@@ -276,7 +329,7 @@
 
 
     # ============================================================
-    # 7. DISPLAY DISCOVERED FORTIGATE
+    # 12. DISPLAY DISCOVERED FORTIGATE
     # ============================================================
 
     - name: Display discovered FortiGate
@@ -302,7 +355,7 @@
 
 
     # ============================================================
-    # 8. AUTHORIZE FORTIGATE DIRECTLY INTO TARGET ADOM
+    # 13. AUTHORIZE FORTIGATE DIRECTLY INTO TARGET ADOM
     # ============================================================
 
     - name: Authorize FortiGate into target ADOM
@@ -353,7 +406,7 @@
 
 
     # ============================================================
-    # 9. VERIFY AUTHORIZE REQUEST
+    # 14. VERIFY AUTHORIZE REQUEST
     # ============================================================
 
     - name: Verify authorize request
@@ -385,7 +438,7 @@
 
 
     # ============================================================
-    # 10. SAVE AUTHORIZE TASK ID
+    # 15. SAVE AUTHORIZE TASK ID
     # ============================================================
 
     - name: Save authorize task ID
@@ -398,22 +451,25 @@
 
 
     # ============================================================
-    # 11. DISPLAY AUTHORIZE TASK ID
+    # 16. DISPLAY AUTHORIZE TASK ID
     # ============================================================
 
     - name: Display authorize task ID
       ansible.builtin.debug:
 
         msg:
+
           - "=============================================="
           - "AUTHORIZE TASK"
           - "=============================================="
+
           - "Task ID : {{ authorize_task_id }}"
+
           - "=============================================="
 
 
     # ============================================================
-    # 12. WAIT FOR AUTHORIZE TASK
+    # 17. WAIT FOR AUTHORIZE TASK
     # ============================================================
 
     - name: Wait for FortiManager authorize task
@@ -469,7 +525,7 @@
 
 
     # ============================================================
-    # 13. DISPLAY AUTHORIZE TASK RESULT
+    # 18. DISPLAY AUTHORIZE TASK RESULT
     # ============================================================
 
     - name: Display authorize task result
@@ -479,7 +535,7 @@
 
 
     # ============================================================
-    # 14. VERIFY AUTHORIZE TASK
+    # 19. VERIFY AUTHORIZE TASK
     # ============================================================
 
     - name: Verify authorize task completed
@@ -513,7 +569,7 @@
 
 
     # ============================================================
-    # 15. WAIT FOR DVM CACHE SYNCHRONIZATION
+    # 20. WAIT FOR DVM CACHE SYNCHRONIZATION
     # ============================================================
 
     - name: Wait for DVM cache synchronization
@@ -522,7 +578,7 @@
 
 
     # ============================================================
-    # 16. GET DEVICES FROM TARGET ADOM
+    # 21. GET DEVICES FROM TARGET ADOM
     # ============================================================
 
     - name: Get devices from target ADOM
@@ -559,7 +615,7 @@
 
 
     # ============================================================
-    # 17. VERIFY TARGET ADOM QUERY
+    # 22. VERIFY TARGET ADOM QUERY
     # ============================================================
 
     - name: Verify target ADOM query
@@ -578,7 +634,7 @@
 
 
     # ============================================================
-    # 18. FIND FORTIGATE IN TARGET ADOM
+    # 23. FIND FORTIGATE IN TARGET ADOM
     # ============================================================
 
     - name: Find FortiGate in target ADOM
@@ -596,7 +652,7 @@
 
 
     # ============================================================
-    # 19. VERIFY FORTIGATE IS IN TARGET ADOM
+    # 24. VERIFY FORTIGATE IS IN TARGET ADOM
     # ============================================================
 
     - name: Verify FortiGate is in target ADOM
@@ -616,7 +672,7 @@
 
 
     # ============================================================
-    # 20. DISPLAY AUTHORIZED DEVICE
+    # 25. DISPLAY AUTHORIZED DEVICE
     # ============================================================
 
     - name: Display authorized device
@@ -638,7 +694,7 @@
 
 
     # ============================================================
-    # 21. DETERMINE VDOM OID
+    # 26. DETERMINE VDOM OID
     # ============================================================
 
     - name: Determine target VDOM OID
@@ -658,7 +714,7 @@
 
 
     # ============================================================
-    # 22. DISPLAY VDOM INFORMATION
+    # 27. DISPLAY VDOM INFORMATION
     # ============================================================
 
     - name: Display VDOM information
@@ -677,7 +733,7 @@
 
 
     # ============================================================
-    # 23. ASSIGN POLICY PACKAGE
+    # 28. ASSIGN POLICY PACKAGE
     # ============================================================
 
     - name: Assign policy package
@@ -726,7 +782,7 @@
 
 
     # ============================================================
-    # 24. DISPLAY POLICY ASSIGNMENT RESULT
+    # 29. DISPLAY POLICY ASSIGNMENT RESULT
     # ============================================================
 
     - name: Display policy assignment result
@@ -736,7 +792,7 @@
 
 
     # ============================================================
-    # 25. VERIFY POLICY ASSIGNMENT
+    # 30. VERIFY POLICY ASSIGNMENT
     # ============================================================
 
     - name: Verify policy package assignment
@@ -769,7 +825,7 @@
 
 
     # ============================================================
-    # 26. FINAL SUMMARY
+    # 31. FINAL SUMMARY
     # ============================================================
 
     - name: Display final Step 3 summary
@@ -781,10 +837,7 @@
           - "STEP 3 - FORTIGATE AUTHORIZATION"
           - "=================================================="
 
-          - "NetBox Asset Tag : {{ asset_tag }}"
-
           - "FortiGate       : {{ authorized_device.name }}"
-
           - "Serial          : {{ authorized_device.sn }}"
 
           - "Target ADOM     : {{ target_adom }}"
@@ -801,7 +854,7 @@
 
 
     # ============================================================
-    # 27. LOGOUT
+    # 32. LOGOUT
     # ============================================================
 
     - name: Logout from FortiManager
