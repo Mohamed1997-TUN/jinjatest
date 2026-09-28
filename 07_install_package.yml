@@ -3,844 +3,861 @@
 # STEP 6 - FORTIMANAGER POLICY PACKAGE INSTALLATION
 # ============================================================
 #
-# Purpose:
-#   Install the policy package already assigned to the selected
-#   FortiGate/VDOM in FortiManager.
-#
-# Source of truth:
-#   NetBox asset_tag -> firewalls.vars
-#
-# Data used from firewalls.vars:
-#   serial
-#   hostname
-#   target_adom
-#   target_vdom
-#   policy_package
-#
-# Design notes:
-#   - Does NOT load firewalls.vars as vars_files. This prevents
-#     unrelated vault_* references from being evaluated.
-#   - Processes only the FortiGate represented by the current
-#     NetBox inventory host.
-#   - Normalizes serial numbers only for comparison because
-#     FortiManager may return separators (example: FGVMEVP1_E5VM0ED).
-#   - Refuses to install when the device, package, or package scope
-#     is not exactly what firewalls.vars defines.
-#   - Uses FortiManager JSON-RPC task polling and always logs out.
-#   - serial: 1 keeps policy installations sequential across hosts.
-#
 # FortiManager:
 #   192.168.101.7
+#
+# ADOM:
+#   dhia
+#
+# Target:
+#   Device         : dhia-staline
+#   Serial         : FGVMEVP1_E5VM0ED
+#   Policy package : dhia_staline
+#   VDOM           : root
 #
 # ============================================================
 
 - name: Step 6 - FortiManager Policy Package Installation
-  hosts: all
-  # NetBox hosts may carry ansible_connection=ssh. FortiManager API calls
-  # are therefore explicitly delegated to the AWX execution controller.
-  connection: local
+  hosts: localhost
   gather_facts: false
-  serial: 1
+
+  # ==========================================================
+  # VARIABLES
+  # ==========================================================
 
   vars_files:
-    - vars/secrets.yml
-    - vars/fortimanager.vars
+    - ../vars/secrets.yml
+    - ../vars/fortimanager.vars
+    - ../vars/firewalls.vars
 
   vars:
-    # ----------------------------------------------------------
-    # FortiManager API settings
-    # ----------------------------------------------------------
     fmg_validate_certs: false
-    fmg_http_timeout: 30
 
-    # ----------------------------------------------------------
-    # Discovery / retry settings
-    # ----------------------------------------------------------
-    device_discovery_retries: 12
-    device_discovery_delay: 5
+    adom: "dhia"
 
-    package_discovery_retries: 8
-    package_discovery_delay: 3
-
-    # ----------------------------------------------------------
-    # Installation task polling
-    # 60 x 5 seconds = up to 5 minutes
-    # ----------------------------------------------------------
     task_poll_interval: 5
     task_max_attempts: 60
+
 
   tasks:
 
     # ========================================================
-    # 1. LOAD FIREWALL SOURCE OF TRUTH
+    # 1. LOGIN TO FORTIMANAGER
     # ========================================================
 
-    - name: Load firewalls.vars without templating its values
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 1
+          method: "exec"
+
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+
+          session: null
+          verbose: 1
+
+        return_content: true
+
+      register: fmg_login
+
+      failed_when:
+        - fmg_login.status != 200
+        - >
+          fmg_login.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+      no_log: true
+
+
+    # ========================================================
+    # 2. SAVE SESSION
+    # ========================================================
+
+    - name: Save FortiManager session
       ansible.builtin.set_fact:
-        firewall_data: >-
-          {{
-            lookup(
-              'ansible.builtin.file',
-              playbook_dir + '/vars/firewalls.vars'
-            )
-            | from_yaml
-          }}
+        fmg_session: "{{ fmg_login.json.session }}"
 
 
     # ========================================================
-    # 2. VALIDATE SOURCE FILE STRUCTURE
+    # 3. DISPLAY LOGIN STATUS
     # ========================================================
 
-    - name: Validate firewalls source data
-      ansible.builtin.assert:
-        that:
-          - firewall_data is mapping
-          - firewall_data.firewalls is defined
-          - firewall_data.firewalls is iterable
-        fail_msg: >-
-          Invalid vars/firewalls.vars structure. Expected a YAML object
-          containing a 'firewalls' list.
-        success_msg: "firewalls.vars source data loaded successfully."
-
-
-    # ========================================================
-    # 3. READ NETBOX ASSET TAG
-    # ========================================================
-    #
-    # NetBox asset_tag is the ONLY inventory-side identifier used
-    # to select the firewall configuration.
-    #
-    # Hosts without asset_tag are intentionally ignored because the
-    # NetBox inventory also contains unrelated/placeholder hosts.
-    # ========================================================
-
-    - name: Normalize NetBox asset_tag
-      ansible.builtin.set_fact:
-        netbox_asset_tag: "{{ asset_tag | default('') | string | trim }}"
-        normalized_device_serial: >-
-          {{
-            asset_tag
-            | default('')
-            | string
-            | regex_replace('[^A-Za-z0-9]', '')
-            | upper
-          }}
-
-
-    # ========================================================
-    # 4. SKIP NON-NETBOX TARGETS
-    # ========================================================
-
-    - name: Skip inventory hosts without a NetBox asset_tag
-      ansible.builtin.meta: end_host
-      when:
-        - netbox_asset_tag | length == 0
-
-
-    # ========================================================
-    # 5. FIND FIREWALL CONFIGURATION BY SERIAL
-    # ========================================================
-
-    - name: Initialize selected firewall matches
-      ansible.builtin.set_fact:
-        selected_firewalls: []
-
-
-    - name: Match NetBox asset_tag to firewalls.vars
-      ansible.builtin.set_fact:
-        selected_firewalls: "{{ selected_firewalls + [item] }}"
-      loop: "{{ firewall_data.firewalls }}"
-      loop_control:
-        label: "{{ item.serial | default('SERIAL-MISSING') }}"
-      when:
-        - item.serial is defined
-        - >-
-          (
-            item.serial
-            | string
-            | regex_replace('[^A-Za-z0-9]', '')
-            | upper
-          ) == normalized_device_serial
-
-
-    # ========================================================
-    # 6. HANDLE UNKNOWN / DUPLICATE SERIALS
-    # ========================================================
-
-    - name: Skip NetBox firewall not present in firewalls.vars
-      ansible.builtin.meta: end_host
-      when:
-        - selected_firewalls | length == 0
-
-
-    - name: Ensure serial maps to exactly one firewall definition
-      ansible.builtin.assert:
-        that:
-          - selected_firewalls | length == 1
-        fail_msg: >-
-          NetBox asset_tag '{{ netbox_asset_tag }}' maps to
-          {{ selected_firewalls | length }} entries in firewalls.vars.
-          Exactly one entry is required to avoid an ambiguous install target.
-
-
-    - name: Save selected firewall definition
-      ansible.builtin.set_fact:
-        selected_firewall: "{{ selected_firewalls[0] }}"
-
-
-    # ========================================================
-    # 7. VALIDATE REQUIRED FIREWALL VARIABLES
-    # ========================================================
-
-    - name: Validate selected firewall configuration
-      ansible.builtin.assert:
-        that:
-          - selected_firewall.serial is defined
-          - selected_firewall.serial | string | trim | length > 0
-          - selected_firewall.hostname is defined
-          - selected_firewall.hostname | string | trim | length > 0
-          - selected_firewall.target_adom is defined
-          - selected_firewall.target_adom | string | trim | length > 0
-          - selected_firewall.target_vdom is defined
-          - selected_firewall.target_vdom | string | trim | length > 0
-          - selected_firewall.policy_package is defined
-          - selected_firewall.policy_package | string | trim | length > 0
-        fail_msg: >-
-          Incomplete firewall definition for NetBox asset_tag
-          '{{ netbox_asset_tag }}'. Required fields are:
-          serial, hostname, target_adom, target_vdom and policy_package.
-
-
-    - name: Build installation parameters
-      ansible.builtin.set_fact:
-        configured_serial: "{{ selected_firewall.serial | string | trim }}"
-        configured_hostname: "{{ selected_firewall.hostname | string | trim }}"
-        target_adom: "{{ selected_firewall.target_adom | string | trim }}"
-        target_vdom: "{{ selected_firewall.target_vdom | string | trim }}"
-        policy_package: "{{ selected_firewall.policy_package | string | trim }}"
-
-
-    - name: Display selected installation target
+    - name: Display login status
       ansible.builtin.debug:
         msg:
+          - "FortiManager login successful."
+          - "FortiManager: {{ fortimanager_host }}"
+          - "ADOM: {{ adom }}"
+
+
+    # ========================================================
+    # 4. DISCOVER DEVICES
+    # ========================================================
+
+    - name: Get FortiGate devices from ADOM
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 2
+          method: "get"
+
+          params:
+            - url: "/dvmdb/adom/{{ adom }}/device"
+
+          session: "{{ fmg_session }}"
+          verbose: 1
+
+        return_content: true
+
+      register: managed_devices_response
+
+      failed_when:
+        - managed_devices_response.status != 200
+        - >
+          managed_devices_response.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+
+    # ========================================================
+    # 5. SAVE DEVICES
+    # ========================================================
+
+    - name: Save managed devices
+      ansible.builtin.set_fact:
+        managed_devices: >-
+          {{
+            managed_devices_response.json.result[0].data
+            | default([])
+          }}
+
+
+    # ========================================================
+    # 6. DISPLAY DISCOVERED DEVICES
+    # ========================================================
+
+    - name: Display discovered FortiGates
+      ansible.builtin.debug:
+        msg:
+          - "FortiGates found in ADOM '{{ adom }}':"
+          - "{{ managed_devices }}"
+
+
+    # ========================================================
+    # 7. SHOW FIREWALLS WITHOUT POLICY PACKAGE
+    # ========================================================
+
+    - name: Show FortiGates without policy package
+      ansible.builtin.debug:
+        msg:
+          - "SKIPPED"
+          - "FortiGate: {{ item.hostname }}"
+          - "Serial: {{ item.serial }}"
+          - "Reason: no policy_package is defined in firewalls.vars."
+
+      loop: "{{ firewalls }}"
+
+      when:
+        - item.policy_package | default('') | length == 0
+
+      loop_control:
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 8. INITIALIZE INSTALLATION TARGETS
+    # ========================================================
+
+    - name: Initialize installation targets
+      ansible.builtin.set_fact:
+        installation_targets: []
+
+
+    # ========================================================
+    # 9. FIND MATCHING FORTIGATE
+    # ========================================================
+
+    - name: Find matching FortiGate
+      ansible.builtin.set_fact:
+
+        installation_targets: >-
+          {{
+            installation_targets +
+            [
+              {
+                'serial': item.serial,
+                'hostname': item.hostname,
+                'device_name': matching_device_name,
+                'policy_package': item.policy_package | default(''),
+                'vdom': item.vdom | default('root'),
+                'device_found': device_found
+              }
+            ]
+          }}
+
+      vars:
+
+        matching_device_name: >-
+          {%- set ns = namespace(name='') -%}
+          {%- for device in managed_devices -%}
+            {%- if device.sn == item.serial -%}
+              {%- set ns.name = device.name -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.name }}
+
+        device_found: >-
+          {%- set ns = namespace(found=false) -%}
+          {%- for device in managed_devices -%}
+            {%- if device.sn == item.serial -%}
+              {%- set ns.found = true -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.found }}
+
+      loop: "{{ firewalls }}"
+
+      when:
+        - item.policy_package | default('') | length > 0
+
+      loop_control:
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 10. DISPLAY INSTALLATION TARGETS
+    # ========================================================
+
+    - name: Display installation targets
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------------------"
+          - "Installation target"
+          - "Configured hostname : {{ item.hostname }}"
+          - "Serial              : {{ item.serial }}"
+          - "FMG device          : {{ item.device_name }}"
+          - "Policy package      : {{ item.policy_package }}"
+          - "VDOM                : {{ item.vdom }}"
+          - "Device found        : {{ item.device_found }}"
+          - "------------------------------------------------------------"
+
+      loop: "{{ installation_targets }}"
+
+      loop_control:
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 11. SHOW MISSING FORTIGATES
+    # ========================================================
+
+    - name: Show missing FortiGates
+      ansible.builtin.debug:
+        msg:
+          - "SKIPPED"
+          - "FortiGate: {{ item.hostname }}"
+          - "Serial: {{ item.serial }}"
+          - "Policy package: {{ item.policy_package }}"
+          - "Reason: device not found in ADOM '{{ adom }}'."
+
+      loop: "{{ installation_targets }}"
+
+      when:
+        - not item.device_found
+
+      loop_control:
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 12. GET POLICY PACKAGES
+    # ========================================================
+
+    - name: Get policy packages from ADOM
+      ansible.builtin.uri:
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+        method: POST
+        validate_certs: "{{ fmg_validate_certs }}"
+        body_format: json
+
+        body:
+          id: 3
+          method: "get"
+
+          params:
+            - url: "/pm/pkg/adom/{{ adom }}"
+
+          session: "{{ fmg_session }}"
+          verbose: 1
+
+        return_content: true
+
+      register: policy_packages_response
+
+      failed_when:
+        - policy_packages_response.status != 200
+        - >
+          policy_packages_response.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+
+    # ========================================================
+    # 13. SAVE POLICY PACKAGES
+    # ========================================================
+
+    - name: Save policy packages
+      ansible.builtin.set_fact:
+        policy_packages: >-
+          {{
+            policy_packages_response.json.result[0].data
+            | default([])
+          }}
+
+
+    # ========================================================
+    # 14. DISPLAY POLICY PACKAGES
+    # ========================================================
+
+    - name: Display policy packages
+      ansible.builtin.debug:
+        msg:
+          - "Policy packages found in ADOM '{{ adom }}':"
+          - "{{ policy_packages }}"
+
+
+    # ========================================================
+    # 15. INITIALIZE PACKAGE TARGETS
+    # ========================================================
+
+    - name: Initialize package targets
+      ansible.builtin.set_fact:
+        package_targets: []
+
+
+    # ========================================================
+    # 16. MATCH POLICY PACKAGE
+    # ========================================================
+
+    - name: Match policy package
+      ansible.builtin.set_fact:
+
+        package_targets: >-
+          {{
+            package_targets +
+            [
+              {
+                'serial': item.serial,
+                'hostname': item.hostname,
+                'device_name': item.device_name,
+                'policy_package': item.policy_package,
+                'vdom': item.vdom,
+                'package_found': package_found
+              }
+            ]
+          }}
+
+      vars:
+
+        package_found: >-
+          {%- set ns = namespace(found=false) -%}
+          {%- for package in policy_packages -%}
+            {%- if package.name == item.policy_package -%}
+              {%- set ns.found = true -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.found }}
+
+      loop: "{{ installation_targets }}"
+
+      when:
+        - item.device_found
+
+      loop_control:
+        label: "{{ item.policy_package }}"
+
+
+    # ========================================================
+    # 17. DISPLAY PACKAGE TARGETS
+    # ========================================================
+
+    - name: Display package installation targets
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------------------"
+          - "Package installation target"
+          - "FortiGate           : {{ item.device_name }}"
+          - "Serial              : {{ item.serial }}"
+          - "Policy package      : {{ item.policy_package }}"
+          - "VDOM                : {{ item.vdom }}"
+          - "Package found       : {{ item.package_found }}"
+          - "------------------------------------------------------------"
+
+      loop: "{{ package_targets }}"
+
+      loop_control:
+        label: "{{ item.hostname }}"
+
+
+    # ========================================================
+    # 18. SHOW MISSING POLICY PACKAGES
+    # ========================================================
+
+    - name: Show missing policy packages
+      ansible.builtin.debug:
+        msg:
+          - "SKIPPED"
+          - "Policy package: {{ item.policy_package }}"
+          - "FortiGate: {{ item.device_name }}"
+          - "Reason: package not found in ADOM '{{ adom }}'."
+
+      loop: "{{ package_targets }}"
+
+      when:
+        - not item.package_found
+
+      loop_control:
+        label: "{{ item.policy_package }}"
+
+
+    # ========================================================
+    # 19. START POLICY PACKAGE INSTALLATION
+    # ========================================================
+
+    - name: Start FortiManager policy package installation
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 4
+
+          method: "exec"
+
+          params:
+
+            - url: "/securityconsole/install/package"
+
+              data:
+
+                adom: "{{ adom }}"
+
+                pkg: "{{ item.policy_package }}"
+
+                scope:
+
+                  - name: "{{ item.device_name }}"
+                    vdom: "{{ item.vdom }}"
+
+                flags:
+
+                  - "none"
+
+          session: "{{ fmg_session }}"
+
+          verbose: 1
+
+        return_content: true
+
+      register: install_requests
+
+      loop: "{{ package_targets }}"
+
+      when:
+        - item.package_found
+        - item.device_name | length > 0
+
+      loop_control:
+        label: "{{ item.device_name }} -> {{ item.policy_package }}"
+
+      failed_when:
+        - install_requests.status != 200
+        - >
+          install_requests.json.result[0].status.code
+          | default(-1)
+          | int != 0
+
+
+    # ========================================================
+    # 20. DISPLAY INSTALLATION REQUEST
+    # ========================================================
+
+    - name: Display installation request result
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate: {{ item.item.device_name }}"
+          - "Package: {{ item.item.policy_package }}"
+          - "Status code: {{ item.json.result[0].status.code | default('UNKNOWN') }}"
+          - "Status message: {{ item.json.result[0].status.message | default('UNKNOWN') }}"
+
+      loop: "{{ install_requests.results | default([]) }}"
+
+      when:
+        - not (item.skipped | default(false))
+
+      loop_control:
+        label: "{{ item.item.device_name | default('unknown') }}"
+
+
+    # ========================================================
+    # 21. VERIFY INSTALLATION REQUEST
+    # ========================================================
+
+    - name: Verify installation request
+      ansible.builtin.assert:
+
+        that:
+          - item.json.result is defined
+          - item.json.result | length > 0
+          - item.json.result[0].status.code | int == 0
+
+        fail_msg: >-
+          Installation request failed for
+          '{{ item.item.device_name }}'
+          using package
+          '{{ item.item.policy_package }}'.
+
+        success_msg: >-
+          Installation request accepted for
+          '{{ item.item.device_name }}'
+          using package
+          '{{ item.item.policy_package }}'.
+
+      loop: "{{ install_requests.results | default([]) }}"
+
+      when:
+        - not (item.skipped | default(false))
+
+      loop_control:
+        label: "{{ item.item.device_name | default('unknown') }}"
+
+
+    # ========================================================
+    # 22. INITIALIZE INSTALLATION TASKS
+    # ========================================================
+
+    - name: Initialize installation tasks
+      ansible.builtin.set_fact:
+        installation_tasks: []
+
+
+    # ========================================================
+    # 23. EXTRACT TASK IDS
+    # ========================================================
+
+    - name: Extract installation task IDs
+      ansible.builtin.set_fact:
+
+        installation_tasks: >-
+          {{
+            installation_tasks +
+            [
+              {
+                'device_name': item.item.device_name,
+                'serial': item.item.serial,
+                'policy_package': item.item.policy_package,
+                'vdom': item.item.vdom,
+                'task_id': task_id
+              }
+            ]
+          }}
+
+      vars:
+
+        task_id: >-
+          {%- set data = item.json.result[0].data | default({}) -%}
+
+          {%- if data.task is defined -%}
+            {{ data.task }}
+
+          {%- elif data is sequence
+                  and data | length > 0
+                  and data[0].task is defined -%}
+
+            {{ data[0].task }}
+
+          {%- else -%}
+            {{ '' }}
+          {%- endif -%}
+
+      loop: "{{ install_requests.results | default([]) }}"
+
+      when:
+        - not (item.skipped | default(false))
+        - item.json.result is defined
+        - item.json.result | length > 0
+        - item.json.result[0].status.code | int == 0
+
+      loop_control:
+        label: "{{ item.item.device_name | default('unknown') }}"
+
+
+    # ========================================================
+    # 24. DISPLAY TASK IDS
+    # ========================================================
+
+    - name: Display installation task IDs
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate      : {{ item.device_name }}"
+          - "Serial         : {{ item.serial }}"
+          - "Policy package : {{ item.policy_package }}"
+          - "VDOM           : {{ item.vdom }}"
+          - "Task ID        : {{ item.task_id }}"
+
+      loop: "{{ installation_tasks }}"
+
+      loop_control:
+        label: "{{ item.device_name }}"
+
+
+    # ========================================================
+    # 25. VERIFY TASK IDS
+    # ========================================================
+
+    - name: Verify installation task IDs
+      ansible.builtin.assert:
+
+        that:
+          - item.task_id is defined
+          - item.task_id | string | length > 0
+
+        fail_msg: >-
+          FortiManager did not return a task ID for
+          '{{ item.device_name }}'
+          using package
+          '{{ item.policy_package }}'.
+
+        success_msg: >-
+          Installation task
+          {{ item.task_id }}
+          created for
+          '{{ item.device_name }}'.
+
+      loop: "{{ installation_tasks }}"
+
+      loop_control:
+        label: "{{ item.device_name }}"
+
+
+    # ========================================================
+    # 26. POLL INSTALLATION TASK
+    # ========================================================
+
+    - name: Wait for FortiManager installation task
+      ansible.builtin.uri:
+
+        url: "https://{{ fortimanager_host }}/jsonrpc"
+
+        method: POST
+
+        validate_certs: "{{ fmg_validate_certs }}"
+
+        body_format: json
+
+        body:
+
+          id: 5
+
+          method: "get"
+
+          params:
+
+            - url: "/task/task/{{ item.task_id }}"
+
+          session: "{{ fmg_session }}"
+
+          verbose: 1
+
+        return_content: true
+
+      register: task_status
+
+      until:
+
+        - task_status.json.result is defined
+        - task_status.json.result | length > 0
+        - >
+          task_status.json.result[0].status.code
+          | default(-1)
+          | int == 0
+        - task_status.json.result[0].data is defined
+        - >
+          task_status.json.result[0].data.percent
+          | default(0)
+          | int == 100
+
+      retries: "{{ task_max_attempts }}"
+
+      delay: "{{ task_poll_interval }}"
+
+      loop: "{{ installation_tasks }}"
+
+      loop_control:
+        label: "{{ item.device_name }} / Task {{ item.task_id }}"
+
+
+    # ========================================================
+    # 27. DISPLAY INSTALLATION TASK RESULT
+    # ========================================================
+
+    - name: Display installation task result
+      ansible.builtin.debug:
+        msg:
+          - "FortiGate: {{ item.item.device_name }}"
+          - "Task ID: {{ item.item.task_id }}"
+          - "Task result:"
+          - "{{ item.json.result[0].data }}"
+
+      loop: "{{ task_status.results | default([]) }}"
+
+      loop_control:
+        label: "{{ item.item.device_name }}"
+
+
+    # ========================================================
+    # 28. VERIFY FINAL INSTALLATION
+    # ========================================================
+
+    - name: Verify final policy package installation
+      ansible.builtin.assert:
+
+        that:
+
+          - item.json.result[0].data.percent | int == 100
+
+          - item.json.result[0].data.num_err | default(0) | int == 0
+
+          - >
+            (
+              item.json.result[0].data.state | string == '4'
+              or
+              item.json.result[0].data.state | string | lower == 'done'
+            )
+
+        fail_msg: >-
+          Policy package installation FAILED.
+
+          FortiGate:
+          {{ item.item.device_name }}
+
+          Package:
+          {{ item.item.policy_package }}
+
+          Task ID:
+          {{ item.item.task_id }}
+
+          Progress:
+          {{ item.json.result[0].data.percent | default(0) }}%
+
+          State:
+          {{ item.json.result[0].data.state | default('unknown') }}
+
+          Errors:
+          {{ item.json.result[0].data.num_err | default(0) }}
+
+          Warnings:
+          {{ item.json.result[0].data.num_warn | default(0) }}
+
+          Detail:
+          {{ item.json.result[0].data.detail | default('') }}
+
+        success_msg: >-
+          Policy package
+          '{{ item.item.policy_package }}'
+          successfully installed on
+          '{{ item.item.device_name }}/{{ item.item.vdom }}'.
+
+      loop: "{{ task_status.results | default([]) }}"
+
+      loop_control:
+        label: "{{ item.item.device_name }}"
+
+
+    # ========================================================
+    # 29. FINAL SUMMARY
+    # ========================================================
+
+    - name: Installation summary
+      ansible.builtin.debug:
+        msg:
+
+          - ""
           - "============================================================"
-          - "FORTIMANAGER POLICY PACKAGE INSTALLATION TARGET"
+          - "STEP 6 - FORTIMANAGER POLICY PACKAGE INSTALLATION"
           - "============================================================"
-          - "NetBox asset_tag : {{ netbox_asset_tag }}"
-          - "Configured serial: {{ configured_serial }}"
-          - "Configured name  : {{ configured_hostname }}"
-          - "Target ADOM      : {{ target_adom }}"
-          - "Target VDOM      : {{ target_vdom }}"
-          - "Policy package   : {{ policy_package }}"
+          - "FortiManager : {{ fortimanager_host }}"
+          - "ADOM         : {{ adom }}"
+          - ""
+          - "Configured FortiGates:"
+          - "{{ firewalls | length }}"
+          - ""
+          - "Installation targets:"
+          - "{{ installation_targets | length }}"
+          - ""
+          - "Installation tasks:"
+          - "{{ installation_tasks | length }}"
+          - ""
+          - "Policy package installation : COMPLETED"
+          - "Final verification          : PASSED"
           - "============================================================"
 
 
     # ========================================================
-    # MAIN FORTIMANAGER WORKFLOW
+    # 30. LOGOUT
     # ========================================================
 
-    - name: Execute policy package installation workflow
-      block:
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
 
-        # ====================================================
-        # 8. LOGIN
-        # ====================================================
+        url: "https://{{ fortimanager_host }}/jsonrpc"
 
-        - name: Login to FortiManager
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 1
-              method: "exec"
-              params:
-                - url: "/sys/login/user"
-                  data:
-                    user: "{{ fortimanager_user }}"
-                    passwd: "{{ fortimanager_password }}"
-              session: null
-              verbose: 1
-            return_content: true
-          register: fmg_login
-          no_log: true
+        method: POST
 
+        validate_certs: "{{ fmg_validate_certs }}"
 
-        - name: Verify FortiManager login
-          ansible.builtin.assert:
-            that:
-              - fmg_login.status == 200
-              - fmg_login.json.result is defined
-              - fmg_login.json.result | length > 0
-              - fmg_login.json.result[0].status.code | default(-1) | int == 0
-              - fmg_login.json.session is defined
-              - fmg_login.json.session | string | length > 0
-            fail_msg: "FortiManager authentication failed."
-            success_msg: "FortiManager authentication successful."
+        body_format: json
 
+        body:
 
-        - name: Save FortiManager session
-          ansible.builtin.set_fact:
-            fmg_session: "{{ fmg_login.json.session }}"
-          no_log: true
+          id: 6
 
+          method: "exec"
 
-        # ====================================================
-        # 9. DISCOVER MANAGED DEVICES IN TARGET ADOM
-        # ====================================================
+          params:
 
-        - name: Get FortiGate devices from target ADOM
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 2
-              method: "get"
-              params:
-                - url: "/dvmdb/adom/{{ target_adom }}/device"
-              session: "{{ fmg_session }}"
-              verbose: 1
-            return_content: true
-          register: managed_devices_response
-          no_log: true
-          until:
-            - managed_devices_response.status | default(0) | int == 200
-            - managed_devices_response.json is defined
-            - managed_devices_response.json.result is defined
-            - managed_devices_response.json.result | length > 0
-            - >-
-              managed_devices_response.json.result[0].status.code
-              | default(-1)
-              | int == 0
-          retries: "{{ device_discovery_retries }}"
-          delay: "{{ device_discovery_delay }}"
-          failed_when: >-
-            managed_devices_response.status | default(0) | int != 200
-            or
-            managed_devices_response.json.result is not defined
-            or
-            managed_devices_response.json.result | length == 0
-            or
-            managed_devices_response.json.result[0].status.code
-            | default(-1)
-            | int != 0
+            - url: "/sys/logout"
 
+          session: "{{ fmg_session }}"
 
-        - name: Save managed devices
-          ansible.builtin.set_fact:
-            managed_devices: >-
-              {{
-                managed_devices_response.json.result[0].data
-                | default([])
-              }}
+          verbose: 1
 
+        return_content: true
 
-        - name: Verify managed device data is usable
-          ansible.builtin.assert:
-            that:
-              - managed_devices is iterable
-            fail_msg: >-
-              FortiManager returned an invalid device list for ADOM
-              '{{ target_adom }}'.
+      when:
+        - fmg_session is defined
 
+      failed_when: false
 
-        # ====================================================
-        # 10. FIND EXACT DEVICE BY NORMALIZED SERIAL
-        # ====================================================
-
-        - name: Initialize FortiManager device matches
-          ansible.builtin.set_fact:
-            target_device_matches: []
-
-
-        - name: Match FortiManager device by normalized serial
-          ansible.builtin.set_fact:
-            target_device_matches: "{{ target_device_matches + [item] }}"
-          loop: "{{ managed_devices }}"
-          loop_control:
-            label: "{{ item.sn | default('SERIAL-MISSING') }}"
-          when:
-            - item.sn is defined
-            - >-
-              (
-                item.sn
-                | string
-                | regex_replace('[^A-Za-z0-9]', '')
-                | upper
-              ) ==
-              (
-                configured_serial
-                | regex_replace('[^A-Za-z0-9]', '')
-                | upper
-              )
-
-
-        - name: Ensure the FortiGate exists exactly once in the target ADOM
-          ansible.builtin.assert:
-            that:
-              - target_device_matches | length == 1
-            fail_msg: >-
-              Expected exactly one FortiManager device for serial
-              '{{ configured_serial }}' in ADOM '{{ target_adom }}',
-              but found {{ target_device_matches | length }}.
-              Installation aborted to prevent targeting the wrong device.
-
-
-        - name: Save target FortiManager device
-          ansible.builtin.set_fact:
-            target_device: "{{ target_device_matches[0] }}"
-            fmg_device_name: "{{ target_device_matches[0].name }}"
-
-
-        - name: Verify target FortiManager device is usable
-          ansible.builtin.assert:
-            that:
-              - target_device.name is defined
-              - target_device.name | string | trim | length > 0
-              - >-
-                target_device.conn_status is not defined
-                or
-                target_device.conn_status | string | lower == 'up'
-            fail_msg: >-
-              FortiGate '{{ target_device.name | default('UNKNOWN') }}'
-              is not in a usable connection state for policy installation.
-              FortiManager conn_status is
-              '{{ target_device.conn_status | default('unknown') }}'.
-            success_msg: >-
-              Target device '{{ fmg_device_name }}' is available in
-              ADOM '{{ target_adom }}'.
-
-
-        - name: Display resolved FortiManager device
-          ansible.builtin.debug:
-            msg:
-              - "FortiGate in FortiManager: {{ fmg_device_name }}"
-              - "FortiManager serial       : {{ target_device.sn }}"
-              - "Configured serial         : {{ configured_serial }}"
-              - "Connection status         : {{ target_device.conn_status | default('not-reported') }}"
-              - "Target ADOM               : {{ target_adom }}"
-              - "Target VDOM               : {{ target_vdom }}"
-
-
-        # ====================================================
-        # 11. DISCOVER POLICY PACKAGES
-        # ====================================================
-
-        - name: Get policy packages from target ADOM
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 3
-              method: "get"
-              params:
-                - url: "/pm/pkg/adom/{{ target_adom }}"
-              session: "{{ fmg_session }}"
-              verbose: 1
-            return_content: true
-          register: policy_packages_response
-          no_log: true
-          until:
-            - policy_packages_response.status | default(0) | int == 200
-            - policy_packages_response.json is defined
-            - policy_packages_response.json.result is defined
-            - policy_packages_response.json.result | length > 0
-            - >-
-              policy_packages_response.json.result[0].status.code
-              | default(-1)
-              | int == 0
-          retries: "{{ package_discovery_retries }}"
-          delay: "{{ package_discovery_delay }}"
-          failed_when: >-
-            policy_packages_response.status | default(0) | int != 200
-            or
-            policy_packages_response.json.result is not defined
-            or
-            policy_packages_response.json.result | length == 0
-            or
-            policy_packages_response.json.result[0].status.code
-            | default(-1)
-            | int != 0
-
-
-        - name: Save policy package list
-          ansible.builtin.set_fact:
-            policy_packages: >-
-              {{
-                policy_packages_response.json.result[0].data
-                | default([])
-              }}
-
-
-        - name: Verify policy package list is usable
-          ansible.builtin.assert:
-            that:
-              - policy_packages is iterable
-            fail_msg: >-
-              FortiManager returned an invalid policy-package list for
-              ADOM '{{ target_adom }}'.
-
-
-        # ====================================================
-        # 12. FIND EXACT POLICY PACKAGE
-        # ====================================================
-
-        - name: Initialize policy package matches
-          ansible.builtin.set_fact:
-            package_matches: []
-
-
-        - name: Match configured policy package exactly
-          ansible.builtin.set_fact:
-            package_matches: "{{ package_matches + [item] }}"
-          loop: "{{ policy_packages }}"
-          loop_control:
-            label: "{{ item.name | default('PACKAGE-NAME-MISSING') }}"
-          when:
-            - item.name is defined
-            - item.name | string == policy_package
-
-
-        - name: Ensure policy package exists exactly once
-          ansible.builtin.assert:
-            that:
-              - package_matches | length == 1
-            fail_msg: >-
-              Policy package '{{ policy_package }}' was not found uniquely
-              in ADOM '{{ target_adom }}'. Matches found:
-              {{ package_matches | length }}.
-              The package must exist before installation; this playbook
-              does not create packages.
-
-
-        - name: Save selected policy package
-          ansible.builtin.set_fact:
-            selected_package: "{{ package_matches[0] }}"
-
-
-        - name: Display resolved policy package
-          ansible.builtin.debug:
-            msg:
-              - "Policy package: {{ selected_package.name }}"
-              - "Package OID   : {{ selected_package.oid | default('not-reported') }}"
-              - "Target device : {{ fmg_device_name }}"
-              - "Target VDOM   : {{ target_vdom }}"
-
-
-        # ====================================================
-        # 13. START POLICY PACKAGE INSTALLATION
-        # ====================================================
-        #
-        # Scope management and VDOM validation are intentionally
-        # handled outside this step. This step only installs the
-        # configured package on the resolved FortiManager device.
-        # ====================================================
-
-        - name: Start FortiManager policy package installation
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 4
-              method: "exec"
-              params:
-                - url: "/securityconsole/install/package"
-                  data:
-                    adom: "{{ target_adom }}"
-                    pkg:
-                      - "{{ policy_package }}"
-                    scope:
-                      - name: "{{ fmg_device_name }}"
-                        vdom: "{{ target_vdom }}"
-                    flags:
-                      - "none"
-              session: "{{ fmg_session }}"
-              verbose: 1
-            return_content: true
-          register: install_request
-          no_log: true
-
-
-        - name: Verify installation request was accepted
-          ansible.builtin.assert:
-            that:
-              - install_request.status == 200
-              - install_request.json.result is defined
-              - install_request.json.result | length > 0
-              - install_request.json.result[0].status.code | default(-1) | int == 0
-              - install_request.json.result[0].data is defined
-            fail_msg: >-
-              FortiManager rejected the installation request for
-              '{{ fmg_device_name }}/{{ target_vdom }}' using package
-              '{{ policy_package }}'.
-              API message:
-              {{ install_request.json.result[0].status.message
-                 | default('No status message returned.') }}
-
-
-        - name: Save installation request data
-          ansible.builtin.set_fact:
-            install_request_data: "{{ install_request.json.result[0].data }}"
-          no_log: true
-
-
-        - name: Extract installation task ID
-          ansible.builtin.set_fact:
-            install_task_id: >-
-              {{
-                install_request_data.task
-                if
-                (
-                  install_request_data is mapping
-                  and install_request_data.task is defined
-                )
-                else
-                install_request_data[0].task
-              }}
-          no_log: true
-
-
-        - name: Verify installation task ID
-          ansible.builtin.assert:
-            that:
-              - install_task_id is defined
-              - install_task_id | string | length > 0
-              - install_task_id | int > 0
-            fail_msg: >-
-              FortiManager accepted the installation request but did not
-              return a valid task ID.
-
-
-        - name: Display accepted installation request
-          ansible.builtin.debug:
-            msg:
-              - "Installation request accepted by FortiManager."
-              - "FortiGate : {{ fmg_device_name }}"
-              - "VDOM      : {{ target_vdom }}"
-              - "Package   : {{ policy_package }}"
-              - "Task ID   : {{ install_task_id }}"
-
-
-        # ====================================================
-        # 15. POLL INSTALLATION TASK
-        # ====================================================
-
-        - name: Poll FortiManager installation task
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 5
-              method: "get"
-              params:
-                - url: "/task/task/{{ install_task_id }}"
-              session: "{{ fmg_session }}"
-              verbose: 1
-            return_content: true
-          register: install_task_status
-          no_log: true
-          until:
-            - >-
-              (
-                install_task_status.status | default(0) | int == 200
-              )
-              and
-              (
-                install_task_status.json is defined
-              )
-              and
-              (
-                install_task_status.json.result is defined
-              )
-              and
-              (
-                install_task_status.json.result | length > 0
-              )
-              and
-              (
-                (
-                  install_task_status.json.result[0].status.code
-                  | default(-1)
-                  | int != 0
-                )
-                or
-                (
-                  install_task_status.json.result[0].data is defined
-                  and
-                  (
-                    install_task_status.json.result[0].data.percent
-                    | default(0)
-                    | int == 100
-                    or
-                    install_task_status.json.result[0].data.num_err
-                    | default(0)
-                    | int > 0
-                    or
-                    install_task_status.json.result[0].data.state
-                    | default('')
-                    | string
-                    | lower
-                    in ['4', 'done', 'failed', 'error', 'aborted', 'cancelled', 'canceled']
-                  )
-                )
-              )
-          retries: "{{ task_max_attempts }}"
-          delay: "{{ task_poll_interval }}"
-          failed_when: false
-
-
-        # ====================================================
-        # 16. SAVE / DISPLAY TASK RESULT
-        # ====================================================
-
-        - name: Save final installation task data
-          ansible.builtin.set_fact:
-            install_task_data: >-
-              {{
-                install_task_status.json.result[0].data
-                if
-                install_task_status.json.result[0].data is mapping
-                else
-                install_task_status.json.result[0].data[0]
-              }}
-          no_log: true
-
-
-        - name: Display final installation task status
-          ansible.builtin.debug:
-            msg:
-              - "============================================================"
-              - "FORTIMANAGER INSTALLATION TASK RESULT"
-              - "============================================================"
-              - "FortiGate : {{ fmg_device_name }}"
-              - "VDOM      : {{ target_vdom }}"
-              - "Package   : {{ policy_package }}"
-              - "Task ID   : {{ install_task_id }}"
-              - "Progress  : {{ install_task_data.percent | default(0) }}%"
-              - "State     : {{ install_task_data.state | default('unknown') }}"
-              - "Errors    : {{ install_task_data.num_err | default(0) }}"
-              - "Warnings  : {{ install_task_data.num_warn | default(0) }}"
-              - "Detail    : {{ install_task_data.detail | default('') }}"
-              - "============================================================"
-
-
-        # ====================================================
-        # 16. FINAL INSTALLATION VERIFICATION
-        # ====================================================
-
-        - name: Verify final policy package installation
-          ansible.builtin.assert:
-            that:
-              - install_task_status.status == 200
-              - install_task_status.json.result is defined
-              - install_task_status.json.result | length > 0
-              - install_task_status.json.result[0].status.code | default(-1) | int == 0
-              - install_task_data.percent | default(0) | int == 100
-              - install_task_data.num_err | default(0) | int == 0
-              - >-
-                (
-                  install_task_data.state | default('') | string == '4'
-                )
-                or
-                (
-                  install_task_data.state | default('') | string | lower == 'done'
-                )
-            fail_msg: >-
-              Policy package installation FAILED or did not reach a
-              successful terminal state.
-
-              FortiGate : {{ fmg_device_name }}
-              VDOM      : {{ target_vdom }}
-              Package   : {{ policy_package }}
-              Task ID   : {{ install_task_id }}
-              Progress  : {{ install_task_data.percent | default(0) }}%
-              State     : {{ install_task_data.state | default('unknown') }}
-              Errors    : {{ install_task_data.num_err | default(0) }}
-              Warnings  : {{ install_task_data.num_warn | default(0) }}
-              Detail    : {{ install_task_data.detail | default('') }}
-            success_msg: >-
-              Policy package '{{ policy_package }}' was successfully
-              installed on '{{ fmg_device_name }}/{{ target_vdom }}'.
-
-
-        # ====================================================
-        # 18. SUCCESS SUMMARY
-        # ====================================================
-
-        - name: Installation success summary
-          ansible.builtin.debug:
-            msg:
-              - ""
-              - "============================================================"
-              - "STEP 6 - POLICY PACKAGE INSTALLATION COMPLETED"
-              - "============================================================"
-              - "FortiManager : {{ fortimanager_host }}"
-              - "NetBox tag   : {{ netbox_asset_tag }}"
-              - "Serial       : {{ configured_serial }}"
-              - "Device       : {{ fmg_device_name }}"
-              - "ADOM         : {{ target_adom }}"
-              - "VDOM         : {{ target_vdom }}"
-              - "Package      : {{ policy_package }}"
-              - "Task ID      : {{ install_task_id }}"
-              - "Result       : SUCCESS"
-              - "============================================================"
-
-
-      # ======================================================
-      # ALWAYS LOGOUT FROM FORTIMANAGER
-      # ======================================================
-
-      always:
-
-        - name: Logout from FortiManager
-          ansible.builtin.uri:
-            delegate_to: localhost
-            url: "https://{{ fortimanager_host }}/jsonrpc"
-            method: POST
-            validate_certs: "{{ fmg_validate_certs }}"
-            timeout: "{{ fmg_http_timeout }}"
-            headers:
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              id: 99
-              method: "exec"
-              params:
-                - url: "/sys/logout"
-              session: "{{ fmg_session }}"
-              verbose: 1
-            return_content: true
-          when:
-            - fmg_session is defined
-            - fmg_session | string | length > 0
-          failed_when: false
-          no_log: true
+      no_log: true
