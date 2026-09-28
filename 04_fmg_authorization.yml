@@ -568,36 +568,17 @@
 
 
         # ======================================================
-        # 5.7 VERIFY TARGET VDOM
+        # 5.7 POLICY PACKAGE
+        # ======================================================
+        #
+        # VDOM discovery/verification is intentionally NOT performed.
+        #
+        # target_vdom comes directly from firewalls.vars and is used
+        # only as the Installation Target attribute.
         # ======================================================
 
-        - name: Find target VDOM object
-          ansible.builtin.set_fact:
-            target_vdom_objects: >-
-              {{
-                authorized_device.vdom
-                | default([])
-                | selectattr('name', 'equalto', target_vdom)
-                | list
-              }}
-
-
-        - name: Verify target VDOM exists
-          ansible.builtin.assert:
-            that:
-              - target_vdom_objects | length == 1
-            fail_msg: >-
-              VDOM '{{ target_vdom }}' was not found on
-              FortiGate '{{ authorized_device.name }}'.
-
-
-        - name: Save target VDOM OID
-          ansible.builtin.set_fact:
-            target_vdom_oid: "{{ target_vdom_objects[0].oid }}"
-
-
         # ======================================================
-        # 5.8 GET POLICY PACKAGE
+        # 5.7 GET POLICY PACKAGE
         # ======================================================
 
         - name: Get configured policy package
@@ -641,7 +622,7 @@
 
 
         # ======================================================
-        # 5.9 DETERMINE INSTALLATION TARGET STATE
+        # 5.8 DETERMINE INSTALLATION TARGET STATE
         # ======================================================
 
         - name: Determine whether exact Installation Target exists
@@ -671,14 +652,13 @@
               - "FortiGate       : {{ authorized_device.name }}"
               - "Device OID      : {{ authorized_device.oid }}"
               - "Target VDOM     : {{ target_vdom }}"
-              - "VDOM OID        : {{ target_vdom_oid }}"
               - "Target Exists   : {{ installation_target_exists }}"
               - "Current Scope   : {{ current_scope_members }}"
               - "============================================================"
 
 
         # ======================================================
-        # 5.10 BUILD COMPLETE DESIRED SCOPE
+        # 5.9 BUILD COMPLETE DESIRED SCOPE
         # ======================================================
         #
         # We use the package-level SET pattern that already exists
@@ -724,7 +704,6 @@
                     'name': authorized_device.name,
                     'oid': authorized_device.oid | string,
                     'vdom': target_vdom,
-                    'vdom_oid': target_vdom_oid | string
                   }
                 ]
               }}
@@ -733,7 +712,7 @@
 
 
         # ======================================================
-        # 5.11 UPDATE PACKAGE INSTALLATION TARGETS
+        # 5.10 UPDATE PACKAGE INSTALLATION TARGETS
         # ======================================================
 
         - name: Set policy package Installation Targets
@@ -785,7 +764,7 @@
 
 
         # ======================================================
-        # 5.12 AUTHORITATIVE RE-READ
+        # 5.11 AUTHORITATIVE RE-READ
         # ======================================================
 
         - name: Re-read policy package after scope update
@@ -861,7 +840,7 @@
 
 
         # ======================================================
-        # 5.13 FINAL SUMMARY
+        # 5.12 FINAL SUMMARY
         # ======================================================
 
         - name: Display final result
