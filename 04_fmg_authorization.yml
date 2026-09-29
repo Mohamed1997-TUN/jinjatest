@@ -1058,11 +1058,11 @@
                 refresh_task_status.json.result[0].data.percent
                 | default(0)
                 | int >= 100
-          fail_msg: >-
-            FortiManager device refresh completed with errors.
+            fail_msg: >-
+              FortiManager device refresh completed with errors.
 
-            Task:
-            {{ refresh_task_status.json.result[0].data | to_nice_json }}
+              Task:
+              {{ refresh_task_status.json.result[0].data | to_nice_json }}
 
         # ====================================================
         # 17. RE-READ DEVICE AFTER REFRESH
@@ -1156,8 +1156,8 @@
                 )
                 ==
                 normalized_device_serial
-          fail_msg: >-
-            FortiManager managed-device identity verification failed.
+            fail_msg: >-
+              FortiManager managed-device identity verification failed.
 
         - name: Display final managed device metadata
           ansible.builtin.debug:
