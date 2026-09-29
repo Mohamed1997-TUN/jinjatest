@@ -916,6 +916,8 @@
               method: get
               params:
                 - url: "/pm/pkg/adom/{{ expected_adom }}/{{ expected_policy_package }}"
+                  option:
+                    - "scope member"
               session: "{{ fmg_session }}"
               verbose: 1
           register: policy_package_response
@@ -1095,11 +1097,23 @@
                 - url: >-
                     /pm/pkg/adom/{{ expected_adom }}/{{ expected_policy_package }}/scope member
                   data:
-                    name: "{{ managed_device.name }}"
-                    vdom: "{{ expected_vdom }}"
+                    - name: "{{ managed_device.name }}"
+                      vdom: "{{ expected_vdom }}"
               session: "{{ fmg_session }}"
               verbose: 1
           register: installation_target_add_response
+          when: not installation_target_exists
+
+        - name: Display Installation Target API response
+          ansible.builtin.debug:
+            msg:
+              - "Installation Target API response:"
+              - >-
+                {{
+                  installation_target_add_response.json
+                  if installation_target_add_response.json is defined
+                  else installation_target_add_response
+                }}
           when: not installation_target_exists
 
         - name: Validate Installation Target API response
@@ -1148,6 +1162,8 @@
               method: get
               params:
                 - url: "/pm/pkg/adom/{{ expected_adom }}/{{ expected_policy_package }}"
+                  option:
+                    - "scope member"
               session: "{{ fmg_session }}"
               verbose: 1
           register: final_policy_package_response
