@@ -284,6 +284,7 @@
         validate_certs: false
         return_content: true
         body_format: json
+        timeout: 20
         body:
           id: 1
           method: exec
@@ -296,20 +297,46 @@
         status_code: 200
       register: fmg_login
       no_log: true
+      failed_when: false
+
+    - name: Build safe FortiManager login diagnostics
+      ansible.builtin.set_fact:
+        fmg_login_http_status: "{{ fmg_login.status | default('unknown') }}"
+        fmg_login_rpc_code: "{{ fmg_login.json.result[0].status.code | default('unknown') if (fmg_login.json is defined and fmg_login.json.result is defined and fmg_login.json.result | length > 0) else 'unknown' }}"
+        fmg_login_rpc_message: "{{ fmg_login.json.result[0].status.message | default('unknown') if (fmg_login.json is defined and fmg_login.json.result is defined and fmg_login.json.result | length > 0) else 'unknown' }}"
+        fmg_login_session_present: "{{ fmg_login.json.session is defined and (fmg_login.json.session | string | length > 0) if fmg_login.json is defined else false }}"
+
+    - name: Display safe FortiManager login diagnostics
+      ansible.builtin.debug:
+        msg:
+          - "FortiManager HTTP status : {{ fmg_login_http_status }}"
+          - "FortiManager RPC code    : {{ fmg_login_rpc_code }}"
+          - "FortiManager RPC message : {{ fmg_login_rpc_message }}"
+          - "Session returned         : {{ fmg_login_session_present }}"
 
     - name: Validate FortiManager login
       ansible.builtin.assert:
         that:
+          - fmg_login.json is defined
           - fmg_login.json.result is defined
           - fmg_login.json.result | length > 0
           - fmg_login.json.result[0].status.code | int == 0
-          - fmg_login.json.result[0].data.session is defined
+          - fmg_login.json.session is defined
+          - fmg_login.json.session | string | trim | length > 0
         fail_msg: >-
           FortiManager login failed.
 
+          HTTP status : {{ fmg_login_http_status }}
+          RPC code    : {{ fmg_login_rpc_code }}
+          RPC message : {{ fmg_login_rpc_message }}
+          Session     : {{ fmg_login_session_present }}
+
+          IMPORTANT: FortiManager returns the session at the top-level
+          JSON attribute 'session', not under result[0].data.session.
+
     - name: Save FortiManager session
       ansible.builtin.set_fact:
-        fmg_session: "{{ fmg_login.json.result[0].data.session }}"
+        fmg_session: "{{ fmg_login.json.session }}"
 
     - name: Display login success
       ansible.builtin.debug:
@@ -1175,6 +1202,82 @@
               - "=========================================="
 
         # ====================================================
+        # 18A. CROSS-CHECK DEVICE ADOM FROM FMG DEVICE STATUS
+        # ====================================================
+        #
+        # This is an additional ADOM-centric verification. The global
+        # device record is queried with "extra info" and "assignment info"
+        # so FortiManager itself confirms the device's ADOM context.
+        # The Installation Target will still be validated from the policy
+        # package scope member later.
+        # ====================================================
+
+        - name: Get detailed FortiManager device status
+          ansible.builtin.uri:
+            url: "{{ fmg_jsonrpc_url }}"
+            method: POST
+            validate_certs: false
+            return_content: true
+            body_format: json
+            body:
+              id: 75
+              method: get
+              params:
+                - url: "/dvmdb/device/{{ authorized_device_final.name }}"
+                  option:
+                    - "extra info"
+                    - "assignment info"
+              session: "{{ fmg_session }}"
+              verbose: 1
+            status_code: 200
+          register: detailed_device_status
+
+        - name: Validate detailed device status response
+          ansible.builtin.assert:
+            that:
+              - detailed_device_status.json.result is defined
+              - detailed_device_status.json.result | length > 0
+              - detailed_device_status.json.result[0].status.code | int == 0
+              - detailed_device_status.json.result[0].data is defined
+            fail_msg: >-
+              FortiManager failed to retrieve detailed status for managed
+              device '{{ authorized_device_final.name }}'.
+
+              Response:
+              {{ detailed_device_status.json | default({}) | to_nice_json }}
+
+        - name: Save detailed device status data
+          ansible.builtin.set_fact:
+            detailed_device_data: "{{ detailed_device_status.json.result[0].data }}"
+
+        - name: Verify managed device belongs to the expected ADOM
+          ansible.builtin.assert:
+            that:
+              - detailed_device_data['extra info'] is defined
+              - detailed_device_data['extra info'].adom is defined
+              - detailed_device_data['extra info'].adom == expected_adom
+            fail_msg: >-
+              ADOM verification FAILED.
+
+              Expected ADOM:
+                {{ expected_adom }}
+
+              FortiManager reported ADOM:
+                {{ detailed_device_data['extra info'].adom | default('missing') }}
+
+              Device:
+                {{ authorized_device_final.name }}
+
+              Refusing to continue because the managed device is not proven
+              to belong to the requested ADOM.
+
+        - name: Display verified device ADOM context
+          ansible.builtin.debug:
+            msg:
+              - "Device ADOM verified: {{ detailed_device_data['extra info'].adom }}"
+              - "Expected ADOM       : {{ expected_adom }}"
+
+        # ====================================================
         # 19. VERIFY MANAGEMENT IP
         # ====================================================
         #
@@ -1644,6 +1747,8 @@
               - "Target VDOM      : {{ expected_vdom }}"
               - "Policy Package   : {{ expected_policy_package }}"
               - "Installation Target: VERIFIED (no policy installation triggered)"
+              - "ADOM boundary       : VERIFIED"
+              - "Management IP       : VERIFIED"
               - "===================================================="
 
       # ======================================================
