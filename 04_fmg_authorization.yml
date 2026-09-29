@@ -1002,13 +1002,11 @@
             installation_target_exists: "{{ exact_target_matches | length == 1 }}"
             wrong_vdom_target_exists: >-
               {{
-                (
-                  same_device_targets | length == 1
-                )
+                same_device_targets | length == 1
                 and
                 (
-                  same_device_targets[0].vdom != expected_vdom
-                )
+                  same_device_targets[0].vdom | default('')
+                ) != expected_vdom
               }}
 
         - name: Refuse existing wrong-VDOM target
@@ -1017,10 +1015,21 @@
               - not wrong_vdom_target_exists
             fail_msg: >-
               The policy package already contains device
-              '{{ managed_device.name }}' as an Installation Target, but
-              with VDOM '{{ same_device_targets[0].vdom }}'.
+              '{{ managed_device.name }}' as an Installation Target with
+              a different VDOM.
 
-              Source of truth specifies VDOM '{{ expected_vdom }}'.
+              Existing VDOM={{
+                (
+                  same_device_targets[0].vdom
+                  if (same_device_targets | length > 0)
+                  else 'unknown'
+                )
+              }}
+
+              Expected VDOM={{ expected_vdom }}
+
+              Existing targets:
+              {{ existing_scope_members | to_nice_json }}
 
               The playbook will not silently change an existing mapping.
 
@@ -1033,6 +1042,27 @@
               - "Management IP    : {{ managed_device.ip }}"
               - "Target VDOM      : {{ expected_vdom }}"
               - "Target exists    : {{ installation_target_exists }}"
+
+        - name: Validate Installation Target API input
+          ansible.builtin.assert:
+            that:
+              - expected_adom | length > 0
+              - expected_policy_package | length > 0
+              - managed_device.name is defined
+              - managed_device.name | string | trim | length > 0
+              - managed_device.ip is defined
+              - managed_device.ip | string | trim == expected_management_ip
+              - expected_vdom | length > 0
+            fail_msg: >-
+              Installation Target input validation failed before the API
+              operation.
+
+              ADOM={{ expected_adom }}
+              Policy Package={{ expected_policy_package }}
+              Device={{ managed_device.name | default('undefined') }}
+              Device IP={{ managed_device.ip | default('undefined') }}
+              Expected IP={{ expected_management_ip }}
+              VDOM field={{ expected_vdom }}
 
         # ====================================================
         # 13. ADD PACKAGE INSTALLATION TARGET
