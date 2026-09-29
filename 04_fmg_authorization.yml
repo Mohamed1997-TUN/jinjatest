@@ -176,6 +176,20 @@
       ansible.builtin.set_fact:
         selected_firewall: "{{ selected_firewalls[0] }}"
 
+    - name: Safety check - target_vdom must never be defined
+      ansible.builtin.assert:
+        that:
+          - selected_firewall.target_vdom is not defined
+        fail_msg: >-
+          Invalid firewall definition for '{{ selected_firewall.hostname | default('unknown') }}'.
+
+          'target_vdom' must NOT be defined in firewalls.vars for this workflow.
+          The FortiGate VDOM is discovered automatically from FortiManager.
+          Only 'target_adom' defines the FortiManager ADOM.
+
+          Remove the following legacy field if present:
+            target_vdom: ...
+
     - name: Validate required firewall attributes
       ansible.builtin.assert:
         that:
@@ -568,6 +582,7 @@
             that:
               - unauthorized_device.name is defined
               - unauthorized_device.name | string | trim | length > 0
+              - unauthorized_device.name | string | trim == expected_hostname
               - unauthorized_device.sn is defined
               - unauthorized_device.ip is defined
               - >-
@@ -856,6 +871,7 @@
             that:
               - managed_device.name is defined
               - managed_device.name | string | trim | length > 0
+              - managed_device.name | string | trim == expected_hostname
               - managed_device.sn is defined
               - >-
                 (
@@ -974,6 +990,23 @@
               multi-VDOM device. Add an explicit VDOM selection mechanism
               before onboarding that device.
           when: managed_device_vdoms | length != 1
+
+        - name: Safety check - ADOM name must never be used as VDOM
+          ansible.builtin.assert:
+            that:
+              - installation_target_vdom != expected_adom
+            fail_msg: >-
+              SAFETY STOP: FortiManager ADOM '{{ expected_adom }}' was selected
+              as the FortiGate VDOM '{{ installation_target_vdom }}'.
+
+              ADOM and VDOM are separate concepts. This automation must never
+              use the ADOM name as a FortiGate VDOM.
+
+              Expected architecture:
+                ADOM = {{ expected_adom }}
+                VDOM = an actual VDOM discovered from the FortiGate
+
+              Available VDOMs={{ managed_device_vdoms | to_nice_json }}
 
         - name: Validate selected Installation Target VDOM
           ansible.builtin.assert:
