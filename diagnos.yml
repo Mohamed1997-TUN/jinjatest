@@ -1,0 +1,472 @@
+---
+# ============================================================
+# DIAGNOSTIC - FortiManager Policy Package / Installation Target
+# ============================================================
+#
+# READ-ONLY PLAYBOOK
+# ------------------
+# This playbook makes NO configuration changes.
+#
+# Purpose:
+#   1. Verify the target ADOM.
+#   2. Verify the managed FortiGate in that ADOM.
+#   3. Read the policy package exactly as FortiManager stores it.
+#   4. Inspect the "scope member" field after a MANUAL
+#      Installation Target assignment in the GUI.
+#
+# IMPORTANT:
+#   Run this AFTER manually adding the FortiGate to the
+#   Installation Targets of the target policy package.
+#
+# We intentionally do NOT:
+#   - authorize
+#   - move devices
+#   - add/remove scope members
+#   - install policy packages
+#
+# ============================================================
+
+- name: DIAGNOSTIC - Inspect FortiManager policy package target structure
+  hosts: all
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/fortimanager.vars
+
+  vars:
+    fmg_jsonrpc_url: "https://{{ fortimanager_host }}/jsonrpc"
+
+    firewall_data: >-
+      {{
+        lookup(
+          'ansible.builtin.file',
+          playbook_dir + '/vars/firewalls.vars'
+        )
+        | from_yaml
+      }}
+
+    firewall_records: >-
+      {{
+        firewall_data.firewalls
+        | default(firewall_data)
+      }}
+
+    netbox_asset_tag: >-
+      {{
+        hostvars[inventory_hostname]['asset_tag']
+        | default('')
+        | string
+        | trim
+      }}
+
+    api_timeout_seconds: 30
+
+  tasks:
+
+    # ========================================================
+    # 1. SOURCE OF TRUTH
+    # ========================================================
+
+    - name: Select firewall from firewalls.vars
+      ansible.builtin.set_fact:
+        selected_firewalls: >-
+          {{
+            firewall_records
+            | selectattr('serial', 'defined')
+            | selectattr('serial', 'equalto', netbox_asset_tag)
+            | list
+          }}
+
+    - name: Validate selected firewall
+      ansible.builtin.assert:
+        that:
+          - netbox_asset_tag | length > 0
+          - selected_firewalls | length == 1
+          - selected_firewalls[0].target_adom is defined
+          - selected_firewalls[0].policy_package is defined
+          - selected_firewalls[0].target_vdom is defined
+        fail_msg: >-
+          Source-of-truth validation failed.
+
+          asset_tag={{ netbox_asset_tag }}
+          matches={{ selected_firewalls | length }}
+
+    - name: Save diagnostic variables
+      ansible.builtin.set_fact:
+        selected_firewall: "{{ selected_firewalls[0] }}"
+        expected_adom: "{{ selected_firewalls[0].target_adom | string | trim }}"
+        expected_policy_package: >-
+          {{ selected_firewalls[0].policy_package | string | trim }}
+        expected_vdom: "{{ selected_firewalls[0].target_vdom | string | trim }}"
+
+    - name: Display diagnostic target
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "FORTIMANAGER INSTALLATION TARGET DIAGNOSTIC"
+          - "============================================================"
+          - "Asset tag       : {{ netbox_asset_tag }}"
+          - "Serial          : {{ selected_firewall.serial }}"
+          - "Management IP   : {{ selected_firewall.management_ip }}"
+          - "Target ADOM     : {{ expected_adom }}"
+          - "Policy Package  : {{ expected_policy_package }}"
+          - "Expected VDOM  : {{ expected_vdom }}"
+          - "============================================================"
+
+    # ========================================================
+    # 2. LOGIN
+    # ========================================================
+
+    - name: Login to FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        timeout: "{{ api_timeout_seconds }}"
+        status_code: 200
+        body:
+          id: 1
+          method: exec
+          params:
+            - url: "/sys/login/user"
+              data:
+                user: "{{ fortimanager_user }}"
+                passwd: "{{ fortimanager_password }}"
+          verbose: 1
+      register: fmg_login
+      no_log: true
+
+    - name: Validate login
+      ansible.builtin.assert:
+        that:
+          - fmg_login.json is defined
+          - fmg_login.json.result is defined
+          - fmg_login.json.result | length > 0
+          - fmg_login.json.result[0].status.code | int == 0
+          - fmg_login.json.session is defined
+        fail_msg: >-
+          FortiManager login failed.
+
+          HTTP={{ fmg_login.status | default('unknown') }}
+          RPC={{
+            fmg_login.json.result[0].status.code
+            if (
+              fmg_login.json is defined
+              and fmg_login.json.result is defined
+              and fmg_login.json.result | length > 0
+            )
+            else 'unknown'
+          }}
+
+    - name: Save session
+      ansible.builtin.set_fact:
+        fmg_session: "{{ fmg_login.json.session }}"
+
+    # ========================================================
+    # 3. ADOM CHECK
+    # ========================================================
+
+    - name: Get ADOM list
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        timeout: "{{ api_timeout_seconds }}"
+        status_code: 200
+        body:
+          id: 10
+          method: get
+          params:
+            - url: "/dvmdb/adom/"
+          session: "{{ fmg_session }}"
+          verbose: 1
+      register: adom_response
+
+    - name: Validate ADOM response
+      ansible.builtin.assert:
+        that:
+          - adom_response.json.result is defined
+          - adom_response.json.result | length > 0
+          - adom_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          Failed to read FortiManager ADOM list.
+
+    - name: Find requested ADOM
+      ansible.builtin.set_fact:
+        target_adom_matches: >-
+          {{
+            adom_response.json.result[0].data
+            | default([])
+            | selectattr('name', 'defined')
+            | selectattr('name', 'equalto', expected_adom)
+            | list
+          }}
+
+    - name: Validate requested ADOM
+      ansible.builtin.assert:
+        that:
+          - target_adom_matches | length == 1
+        fail_msg: >-
+          Requested ADOM '{{ expected_adom }}' was not found uniquely.
+
+    # ========================================================
+    # 4. MANAGED DEVICE IN TARGET ADOM
+    # ========================================================
+
+    - name: Get target ADOM devices
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        timeout: "{{ api_timeout_seconds }}"
+        status_code: 200
+        body:
+          id: 20
+          method: get
+          params:
+            - url: "/dvmdb/adom/{{ expected_adom }}/device"
+          session: "{{ fmg_session }}"
+          verbose: 1
+      register: device_response
+
+    - name: Validate target ADOM device response
+      ansible.builtin.assert:
+        that:
+          - device_response.json.result is defined
+          - device_response.json.result | length > 0
+          - device_response.json.result[0].status.code | int == 0
+        fail_msg: >-
+          Failed to read devices from ADOM '{{ expected_adom }}'.
+
+    - name: Initialize device matches
+      ansible.builtin.set_fact:
+        diagnostic_device_matches: []
+
+    - name: Match source-of-truth serial in target ADOM
+      ansible.builtin.set_fact:
+        diagnostic_device_matches: >-
+          {{
+            diagnostic_device_matches
+            +
+            (
+              [item]
+              if (
+                item.sn is defined
+                and
+                (
+                  item.sn
+                  | string
+                  | regex_replace('[^A-Za-z0-9]', '')
+                  | upper
+                )
+                ==
+                (
+                  selected_firewall.serial
+                  | string
+                  | regex_replace('[^A-Za-z0-9]', '')
+                  | upper
+                )
+              )
+              else []
+            )
+          }}
+      loop: "{{ device_response.json.result[0].data | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('unknown') }}"
+
+    - name: Validate managed device
+      ansible.builtin.assert:
+        that:
+          - diagnostic_device_matches | length == 1
+          - diagnostic_device_matches[0].ip is defined
+          - diagnostic_device_matches[0].ip | string | trim == selected_firewall.management_ip | string | trim
+        fail_msg: >-
+          Managed device identity/IP check failed.
+
+          Expected serial={{ selected_firewall.serial }}
+          Expected IP={{ selected_firewall.management_ip }}
+
+          Matches:
+          {{ diagnostic_device_matches | to_nice_json }}
+
+    - name: Display managed device record
+      ansible.builtin.debug:
+        msg:
+          - "Managed device in target ADOM:"
+          - "{{ diagnostic_device_matches[0] | to_nice_json }}"
+
+    # ========================================================
+    # 5. READ POLICY PACKAGE - RAW
+    #
+    # Important: do NOT force the "scope member" option here.
+    # We want to observe exactly what the normal package GET
+    # returns after the GUI assignment.
+    # ========================================================
+
+    - name: Get policy package exactly as stored by FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        timeout: "{{ api_timeout_seconds }}"
+        status_code: 200
+        body:
+          id: 30
+          method: get
+          params:
+            - url: >-
+                /pm/pkg/adom/{{ expected_adom }}/{{ expected_policy_package }}
+          session: "{{ fmg_session }}"
+          verbose: 1
+      register: policy_package_response
+
+    - name: Validate policy package response
+      ansible.builtin.assert:
+        that:
+          - policy_package_response.json.result is defined
+          - policy_package_response.json.result | length > 0
+          - policy_package_response.json.result[0].status.code | int == 0
+          - policy_package_response.json.result[0].data is defined
+        fail_msg: >-
+          Failed to read policy package
+          '{{ expected_policy_package }}' from ADOM
+          '{{ expected_adom }}'.
+
+          Response:
+          {{ policy_package_response.json | to_nice_json }}
+
+    - name: Save raw policy package data
+      ansible.builtin.set_fact:
+        diagnostic_policy_package: >-
+          {{ policy_package_response.json.result[0].data }}
+
+    # ========================================================
+    # 6. PRINT EXACT JSON STRUCTURE
+    # ========================================================
+
+    - name: Display complete policy package JSON
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "RAW POLICY PACKAGE OBJECT"
+          - "============================================================"
+          - "{{ diagnostic_policy_package | to_nice_json }}"
+          - "============================================================"
+
+    - name: Display policy package top-level keys
+      ansible.builtin.debug:
+        msg:
+          - "Policy package keys:"
+          - "{{ diagnostic_policy_package.keys() | list | sort }}"
+
+    - name: Display scope member type
+      ansible.builtin.debug:
+        msg:
+          - "scope member defined: {{ 'scope member' in diagnostic_policy_package }}"
+          - >-
+            scope member type:
+            {{
+              diagnostic_policy_package['scope member']
+              | default([])
+              | type_debug
+            }}
+          - >-
+            scope member count:
+            {{
+              diagnostic_policy_package['scope member']
+              | default([])
+              | length
+            }}
+
+    # ========================================================
+    # 7. DISPLAY INSTALLATION TARGETS
+    # ========================================================
+
+    - name: Display Installation Target structure
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "INSTALLATION TARGET STRUCTURE"
+          - "============================================================"
+          - >-
+            {{
+              diagnostic_policy_package['scope member']
+              | default([])
+              | to_nice_json
+            }}
+          - "============================================================"
+
+    # ========================================================
+    # 8. FIND MANUAL TARGET BY DEVICE NAME
+    # ========================================================
+
+    - name: Extract exact manual target matches
+      ansible.builtin.set_fact:
+        diagnostic_scope_matches: >-
+          {{
+            diagnostic_policy_package['scope member']
+            | default([])
+            | selectattr('name', 'defined')
+            | selectattr('name', 'equalto', diagnostic_device_matches[0].name)
+            | list
+          }}
+
+    - name: Display manual target matches
+      ansible.builtin.debug:
+        msg:
+          - "Managed device name : {{ diagnostic_device_matches[0].name }}"
+          - "Expected VDOM       : {{ expected_vdom }}"
+          - "Matching scope member entries:"
+          - "{{ diagnostic_scope_matches | to_nice_json }}"
+
+    # ========================================================
+    # 9. NON-DESTRUCTIVE CONCLUSION
+    # ========================================================
+
+    - name: Report target mapping state
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "DIAGNOSTIC RESULT"
+          - "============================================================"
+          - "ADOM               : {{ expected_adom }}"
+          - "Policy Package     : {{ expected_policy_package }}"
+          - "Managed Device     : {{ diagnostic_device_matches[0].name }}"
+          - "Management IP      : {{ diagnostic_device_matches[0].ip }}"
+          - "Manual target found: {{ diagnostic_scope_matches | length > 0 }}"
+          - "Scope member JSON  : {{ diagnostic_scope_matches | to_nice_json }}"
+          - ""
+          - "NO CONFIGURATION WAS CHANGED."
+          - "============================================================"
+
+      # ======================================================
+      # ALWAYS LOGOUT
+      # ======================================================
+
+    - name: Logout from FortiManager
+      ansible.builtin.uri:
+        url: "{{ fmg_jsonrpc_url }}"
+        method: POST
+        validate_certs: false
+        return_content: true
+        body_format: json
+        timeout: "{{ api_timeout_seconds }}"
+        status_code: 200
+        body:
+          id: 999
+          method: exec
+          params:
+            - url: "/sys/logout"
+          session: "{{ fmg_session }}"
+          verbose: 1
+      when: fmg_session is defined
+      no_log: true
